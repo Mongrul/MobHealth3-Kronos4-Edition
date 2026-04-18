@@ -1,5 +1,5 @@
-MobHealth3: Kronos Edition (1.12)
-Updated for Kronos 4 by Mirasu (formerly of Kronos 3)
+# MobHealth3: Kronos Edition (1.12)
+# Updated for Kronos 4 by Mirasu (formerly of Kronos 3)
 The original Kronos Mob DB was lost, so it was recreated from scratch via the Twinstar DB.
 The DB file is now nested into the addon.
 
