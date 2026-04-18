@@ -1,23 +1,17 @@
-# MobHealth3-Kronos3-Edition
-MobHealth3 Kronos Edition 1.12 - Shows the exact NPC Health. (Extracted from vanilla-twinhead.twinstar.cz).
+MobHealth3: Kronos Edition (1.12)
+Updated for Kronos 4 by Mirasu (formerly of Kronos 3)
+The original Kronos Mob DB was lost, so it was recreated from scratch via the Twinstar DB.
+The DB file is now nested into the addon.
 
-Step by Step:
+Features
+The included DB contains every mob in the game with Kronos values. It only contains the max level version of that specific npc and its max health since that is known. I have improved the originals calcualtion method for lower level versions of a mob using a guestimator that has been thourogly tested. The original version of this addoon only had recording logic that would record and keep the lower level version of that mobs health once hit. These two now work in conjunction too provide a completely accurate health value. 
 
-1. Download newest Version. (Clone or Download Button)
-2. Drag the MobHealth folder inside of MobHealth3-Kronos3-Edition-master into World of Warcraft 1.12\Interface\AddOns.
-3. Download: http://bit.ly/KronosDBMobHealth
-4. Put the file from step 3 into World of Warcraft 1.12\WTF\Account\AccountName\SavedVariables
-5. Done
+pfUI - To use this with pfUI you must disable Health Point Estimation in Settings
 
-Standard Blizzard UI User also need: https://www.wowace.com/projects/project-14403/files
+Luna - Use the [smarthealth] Tag in the Target Health Bar 
 
-# Example
-![alt text](https://i.imgur.com/2xVqsiU.png)
+Blizzard Frames - This is now baked in and does not require a seperate file.
 
-# Changes
-- Removed guessing of NPC Health values.
-- Fixed Boss Level to DB error.
-- Fixed nil return error.
+Compatible with SuperWoW: It was causing some issues.
 
-# Issues
-- While below level 60 a "skull" enemy can't have it's exact values shown.
+Nameplate Compatibility: Tested on my fork of Kui Nameplates
