@@ -172,47 +172,29 @@ function MobHealth3:PLAYER_TARGET_CHANGED()
 		currentAccHP = AccumulatorHP[targetIndex]
 		currentAccPerc = AccumulatorPerc[targetIndex]
 
-		if not UnitIsPlayer("target") then
-			-- Mob: keep accumulated percentage below 200% in case we hit mobs with different hp
-			if not currentAccHP then
-				if MH3Cache[targetIndex] then
-					-- We claim that this previous value that we have is from seeing percentage drop from 100 to 0
-					AccumulatorHP[targetIndex] = MH3Cache[targetIndex]
-					AccumulatorPerc[targetIndex] = 100
-				else
-					-- Nothing previously known. Start fresh.
-					AccumulatorHP[targetIndex] = 0
-					AccumulatorPerc[targetIndex] = 0
-				end
-				currentAccHP = AccumulatorHP[targetIndex]
-				currentAccPerc = AccumulatorPerc[targetIndex]
+	if not currentAccHP then
+			if MH3Cache[targetIndex] then
+				AccumulatorHP[targetIndex] = MH3Cache[targetIndex]
+				AccumulatorPerc[targetIndex] = 100
+			elseif MobHealthDB and MobHealthDB[targetIndex] then
+				-- MIRASU FIX: Check the static database if local cache is empty
+				local _, _, foundMax = string.find(tostring(MobHealthDB[targetIndex]), ".+/(%d+)")
+				AccumulatorHP[targetIndex] = tonumber(foundMax or MobHealthDB[targetIndex])
+				AccumulatorPerc[targetIndex] = 100
+			else
+				AccumulatorHP[targetIndex] = 0
+				AccumulatorPerc[targetIndex] = 0
 			end
-
-			if currentAccPerc>200 then
-				currentAccHP = currentAccHP / currentAccPerc * 100
-				currentAccPerc = 100
-			end
-
-		else
-			-- Player health can change a lot. Different gear, buffs, etc.. we only assume that we've seen 10% knocked off players previously
-			if not currentAccHP then
-				if MH3Cache[targetIndex] then
-					AccumulatorHP[targetIndex] = MH3Cache[targetIndex]*0.1
-					AccumulatorPerc[targetIndex] = 10
-				else
-					AccumulatorHP[targetIndex] = 0
-					AccumulatorPerc[targetIndex] = 0
-				end
-				currentAccHP = AccumulatorHP[targetIndex]
-				currentAccPerc = AccumulatorPerc[targetIndex]
-			end
-	
-			if currentAccPerc>10 then
-				currentAccHP = currentAccHP / currentAccPerc * 10
-				currentAccPerc = 10
-			end
-
+			currentAccHP = AccumulatorHP[targetIndex]
+			currentAccPerc = AccumulatorPerc[targetIndex]
 		end
+
+		-- Stability check for accumulated data
+		local maxLimit = UnitIsPlayer("target") and 10 or 200
+		if currentAccPerc > maxLimit then
+			currentAccHP = (currentAccHP / currentAccPerc) * maxLimit
+			currentAccPerc = maxLimit
+		end	
 
 	else
 		--self:Debug("Acquired invalid target. Ignoring")
