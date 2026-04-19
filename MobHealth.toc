@@ -4,7 +4,7 @@
 ## Version: 3.4
 ## OptionalDeps: Ace2, MobInfo2, pfUI, LunaUnitFrames
 ## Notes: Exact Mob Health.
-## SavedVariables: MobHealthDB, MobHealth3Config
+## SavedVariables: MobHealth3Config
 Libs\AceLibrary\AceLibrary.lua
 Libs\AceOO-2.0\AceOO-2.0.lua
 Libs\AceEvent-2.0\AceEvent-2.0.lua
@@ -12,5 +12,5 @@ Libs\AceAddon-2.0\AceAddon-2.0.lua
 Libs\AceConsole-2.0\AceConsole-2.0.lua
 Libs\AceDebug-2.0\AceDebug-2.0.lua
 Libs\AceDB-2.0\AceDB-2.0.lua
-Data.lua
 MobHealth3.lua
+Data.lua

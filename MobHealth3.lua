@@ -10,15 +10,13 @@
 
 MobHealth3 = AceLibrary("AceAddon-2.0"):new("AceEvent-2.0", "AceConsole-2.0", "AceDB-2.0")
 
---[[
-	File-scope local vars
---]]
+-- PROTECTION: Claim the global database without overwriting it
+MobHealth3_StaticDB = MobHealth3_StaticDB or {}
 
 local MH3Cache = {}
-
-local AccumulatorHP = {} -- Keeps Damage-taken data for mobs that we've actually poked during this session
-local AccumulatorPerc = {} -- Keeps Percentage-taken data for mobs that we've actually poked during this session
-local calculationUnneeded = {} -- Keeps a list of things that don't need calculation (e.g. Beast Lore'd mobs)
+local AccumulatorHP = {} 
+local AccumulatorPerc = {} 
+local calculationUnneeded = {} 
 
 local currentAccHP
 local currentAccPerc
@@ -33,24 +31,39 @@ local defaults = {
     stableMax = true,
 }
 
--- Corrected Metatable: This prevents the infinite loop/C Stack Overflow
-local compatMT = {
+--  PVP: Baseline health multipliers by class for the Plausibility Filter
+local ClassHPMultipliers = {
+    ["MAGE"] = 55,
+    ["PRIEST"] = 60,
+    ["ROGUE"] = 65,
+    ["HUNTER"] = 70,
+    ["DRUID"] = 70,
+    ["SHAMAN"] = 75,
+    ["PALADIN"] = 80,
+    ["WARLOCK"] = 80,
+    ["WARRIOR"] = 90,
+}
+
+-- Corrected Metatable: Handles Exact Match -> ?? Level -> Name-Only
+compatMT = {
     __index = function(t, k)
-        local val = rawget(t, k)
+        local val = rawget(t, k) or rawget(t, string.gsub(tostring(k), ":%d+$", ":63")) or rawget(t, string.gsub(tostring(k), ":%d+$", ""))
         if val then
-            -- This looks for the number after the "/" (the 156)
-            local _, _, health = string.find(val, ".+/(%d+)")
-            if health then
-                return health .. "/100"
-            else
-                -- If it's just a number like "156", use it as is
-                return val .. "/100"
-            end
+            -- FIX: Always extract only the health portion
+            local _, _, health = string.find(tostring(val), ".+/(%d+)")
+            return (health or val) .. "/100"
         end
         return nil
     end
 }
 
+--  MASTER BRIDGE: Initialized after Metatable is ready
+MobHealthDB = setmetatable(MobHealth3_StaticDB, compatMT)
+MobHealth3DB = MobHealthDB
+
+if pfUI and pfUI.api then
+    pfUI.api.libmobhealth = MobHealthDB
+end
 -- Debug function. Not for Joe Average
 function GetMH3Cache() return MH3Cache end
 
@@ -60,13 +73,10 @@ function GetMH3Cache() return MH3Cache end
 --]]
 
 function MobHealth3:OnInitialize()
-    -- 1. Ensure the Database exists
-    if not MobHealthDB then MobHealthDB = {} end
-    
-    -- 2. Register Database with Ace2
+    -- Register our local config/cache
     self.db = self:RegisterDB("MobHealth3Config")
 
-    -- 3. Register Chat Commands (Option A)
+    -- Register Chat Commands
     self:RegisterChatCommand({"/mobhealth3", "/mh3"}, {
         type = "group",
         args = {
@@ -77,37 +87,20 @@ function MobHealth3:OnInitialize()
                 get = function() return true end,
                 set = function(val) end,
             },
-            -- ... (your other args: precision, stablemax, reset)
         },
     })
 
-    -- 4. THE UNIVERSAL BRIDGES (Force pfUI compatibility)
-    MobHealth3DB = MobHealthDB
-    
-    if pfUI and pfUI.api then
-        -- Force pfUI's shared library to point to our database
-        pfUI.api.libmobhealth = MobHealthDB
-        
-        -- pfUI specific: If it has its own internal cache, we overwrite it
-        if pfUI.cache and pfUI.cache["libmobhealth"] then
-            pfUI.cache["libmobhealth"] = MobHealthDB
-        end
-    end
 
-    -- 5. Enable the Guestimator/Format Metatable
-    setmetatable(MobHealthDB, compatMT)
+
     
-    DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00MobHealth3:|r Database Loaded (".. (MobHealthDB and "ALIVE" or "DEAD") ..")")
-    -- V7: ERROR-PROOF INJECTOR (Place inside OnInitialize)
-    local injector = CreateFrame("Frame")
-    -- V8: CLEAN INJECTOR (Target Frame only, No Tooltips)
+    DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00MobHealth3:|r Protected Database Loaded.")
     local injector = CreateFrame("Frame")
     injector:SetScript("OnUpdate", function()
         -- 1. TARGET FRAME OVERLAY (Silent)
         -- We only update the Blizzard Target frame. 
         -- Dedicated tooltip addons will handle the tooltip their own way.
         if TargetFrame and TargetFrame:IsVisible() then
-            local c, m, found = MobHealth3:GetUnitHealth("target")
+            local c, m, found = self:GetUnitHealth("target")
             if found then
                 if not MH3_TargetOverlay then
                     MH3_TargetOverlay = TargetFrame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
@@ -122,7 +115,7 @@ function MobHealth3:OnInitialize()
 
         -- 2. TARGET OF TARGET (Optional) untested
         if TargetofTargetFrame and TargetofTargetFrame:IsVisible() then
-             local c, m, found = MobHealth3:GetUnitHealth("targettarget")
+             local c, m, found = self:GetUnitHealth("targettarget")
              if found then
                  local tot = getglobal("TargetofTargetHealthBarText")
                  if tot and tot.SetText then tot:SetText(c .. " / " .. m) end
@@ -130,7 +123,35 @@ function MobHealth3:OnInitialize()
         end
     end)
     
-    DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00MobHealth3:|r Ultra-Compatible Mode Active.")
+end
+
+function MobHealth3:OnEnable()
+    self:RegisterEvent("PLAYER_TARGET_CHANGED")
+    self:RegisterEvent("UNIT_HEALTH")
+    
+    -- Self Combat
+    self:RegisterEvent("CHAT_MSG_COMBAT_SELF_HITS", "CombatLogParser")
+    self:RegisterEvent("CHAT_MSG_SPELL_SELF_DAMAGE", "CombatLogParser")
+    
+    -- Group & Faction Combat (Other players of your faction)
+    self:RegisterEvent("CHAT_MSG_COMBAT_PARTY_HITS", "CombatLogParser")
+    self:RegisterEvent("CHAT_MSG_COMBAT_FRIENDLYPLAYER_HITS", "CombatLogParser")
+    self:RegisterEvent("CHAT_MSG_SPELL_PARTY_DAMAGE", "CombatLogParser")
+    self:RegisterEvent("CHAT_MSG_SPELL_FRIENDLYPLAYER_DAMAGE", "CombatLogParser")
+    
+    -- Enemy Faction Combat (Opposing faction players hitting your target)
+    self:RegisterEvent("CHAT_MSG_COMBAT_HOSTILEPLAYER_HITS", "CombatLogParser")
+    self:RegisterEvent("CHAT_MSG_SPELL_HOSTILEPLAYER_DAMAGE", "CombatLogParser")
+    
+    -- Pets, Summons, and Guards
+    self:RegisterEvent("CHAT_MSG_COMBAT_CREATURE_VS_CREATURE_HITS", "CombatLogParser")
+    self:RegisterEvent("CHAT_MSG_SPELL_CREATURE_VS_CREATURE_DAMAGE", "CombatLogParser")
+
+    -- Periodic Damage (DoTs - Catches all DoT damage regardless of who cast it)
+    self:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_CREATURE_DAMAGE", "CombatLogParser")
+    self:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_HOSTILEPLAYER_DAMAGE", "CombatLogParser")
+    self:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_PARTY_DAMAGE", "CombatLogParser")
+    self:RegisterEvent("CHAT_MSG_SPELL_PERIODIC_FRIENDLYPLAYER_DAMAGE", "CombatLogParser")
 end
 
 --[[
@@ -143,107 +164,129 @@ CreateFrame("frame", "MobHealthFrame")
     Event Handlers
 --]]
 
-function MobHealth3:UNIT_COMBAT()
-	if arg1=="target" and currentAccHP then
-		recentDamage = recentDamage + arg4
-		totalDamage = totalDamage + arg4
-	end
-end
+function MobHealth3:CombatLogParser()
+    local mobName, damage
 
-function MobHealth3:PLAYER_TARGET_CHANGED()
+    -- 1. Catch generic Hits (Melee & Spell, Self & Others)
+    _, _, mobName, damage = string.find(arg1, " hits (.+) for (%d+)")
+    
+    -- 2. Catch generic Crits
+    if not mobName then
+        _, _, mobName, damage = string.find(arg1, " crits (.+) for (%d+)")
+    end
+    
+    -- 3. Catch DoTs and Environmental
+    if not mobName then
+        _, _, mobName, damage = string.find(arg1, "^(.+) suffers (%d+)")
+    end
+    
+    -- 4. Catch specific WoW 1.12 "You" formatting
+    if not mobName then
+        _, _, mobName, damage = string.find(arg1, "^You hit (.+) for (%d+)")
+    end
+    if not mobName then
+        _, _, mobName, damage = string.find(arg1, "^You crit (.+) for (%d+)")
+    end
 
-	-- Is target valid?
-	-- We ignore pets. There's simply far too many pets that share names with players so we let players take priority
-
-	local creatureType = UnitCreatureType("target") -- Saves us from calling it twice
-	if UnitCanAttack("player", "target") and not UnitIsDead("target") and not UnitIsFriend("player", "target") and not ( (creatureType == "Beast" or creatureType == "Demon") and UnitPlayerControlled("target") ) then
-
-		targetName = UnitName("target")
-		targetLevel = UnitLevel("target")
-
-		targetIndex = string.format("%s:%d", targetName, targetLevel)
-
-		--self:Debug("Acquired valid target: index: %s, in db: %s", targetIndex, not not MH3Cache[targetIndex])
-
-		recentDamage, totalDamage = 0, 0, 0
-		startPercent = UnitHealth("target")
-		lastPercent = startPercent
-
-		currentAccHP = AccumulatorHP[targetIndex]
-		currentAccPerc = AccumulatorPerc[targetIndex]
-
-	if not currentAccHP then
-			if MH3Cache[targetIndex] then
-				AccumulatorHP[targetIndex] = MH3Cache[targetIndex]
-				AccumulatorPerc[targetIndex] = 100
-			elseif MobHealthDB and MobHealthDB[targetIndex] then
-				-- MIRASU FIX: Check the static database if local cache is empty
-				local _, _, foundMax = string.find(tostring(MobHealthDB[targetIndex]), ".+/(%d+)")
-				AccumulatorHP[targetIndex] = tonumber(foundMax or MobHealthDB[targetIndex])
-				AccumulatorPerc[targetIndex] = 100
-			else
-				AccumulatorHP[targetIndex] = 0
-				AccumulatorPerc[targetIndex] = 0
-			end
-			currentAccHP = AccumulatorHP[targetIndex]
-			currentAccPerc = AccumulatorPerc[targetIndex]
-		end
-
-		-- Stability check for accumulated data
-		local maxLimit = UnitIsPlayer("target") and 10 or 200
-		if currentAccPerc > maxLimit then
-			currentAccHP = (currentAccHP / currentAccPerc) * maxLimit
-			currentAccPerc = maxLimit
-		end	
-
-	else
-		--self:Debug("Acquired invalid target. Ignoring")
-		currentAccHP = nil
-		currentAccPerc = nil
-	end
+    -- Verify the damage happened to our actual target
+    if mobName and damage then
+        if mobName == targetName and currentAccHP then
+            recentDamage = recentDamage + tonumber(damage)
+            totalDamage = totalDamage + tonumber(damage)
+        end
+    end
 end
 
 function MobHealth3:UNIT_HEALTH()
-	if currentAccHP and arg1=="target" then 
-		self:CalculateMaxHealth(UnitHealth("target"), UnitHealthMax("target")) 
-	end
+    if arg1 == "target" and currentAccHP ~= nil then 
+        self:CalculateMaxHealth(UnitHealth("target"), UnitHealthMax("target")) 
+    end
 end
 
---[[
-	The meat of the machine!
---]]
-
 function MobHealth3:CalculateMaxHealth(current, max)
-
-	if calculationUnneeded[targetIndex] then return;
-    
-    elseif current==startPercent or current==0 then
-	--self:Debug("Targetting a dead guy?")
-    
+    if current == startPercent or current == 0 then
+        return
     elseif max > 100 then
-        -- zOMG! Beast Lore! We no need no stinking calculations!
-        MH3Cache[targetIndex] = max
-        -- print(string.format("We got beast lore! Max is %d", max))
-        calculationUnneeded[targetIndex] = true
+        return
+    elseif current > lastPercent or startPercent > 100 then
+        lastPercent = current
+        startPercent = current
+        recentDamage = 0
+        totalDamage = 0
+    elseif recentDamage > 0 then
+        if current ~= lastPercent then
+            currentAccHP = currentAccHP + recentDamage
+            currentAccPerc = currentAccPerc + (lastPercent - current)
+            recentDamage = 0
+            lastPercent = current 
+            
+            AccumulatorHP[targetIndex] = currentAccHP
+            AccumulatorPerc[targetIndex] = currentAccPerc
+        end
+    end
+end
 
-	elseif current > lastPercent or startPercent>100 then
-		-- Oh noes! It healed! :O
-		lastPercent = current
-		startPercent = current
-		recentDamage=0
-		totalDamage=0
-		--self:Debug("O NOES IT HEALED!?")
+function MobHealth3:PLAYER_TARGET_CHANGED()
+    if UnitExists("target") and not UnitIsDead("target") and not UnitIsFriend("player", "target") then
+        targetName = UnitName("target")
+        targetLevel = UnitLevel("target")
 
-	elseif recentDamage>0 then
+        targetIndex = string.format("%s:%d", targetName, targetLevel)
+        recentDamage, totalDamage = 0, 0
+        startPercent = UnitHealth("target")
+        lastPercent = startPercent
 
-		if current~=lastPercent then
-			currentAccHP = currentAccHP + recentDamage
-			currentAccPerc = currentAccPerc + (lastPercent-current)
-			recentDamage = 0
-			lastPercent = current		
-		end
-		
-	end
+        -- Default to 0 so combat estimator can begin tracking players/unknowns
+        currentAccHP = AccumulatorHP[targetIndex] or 0
+        currentAccPerc = AccumulatorPerc[targetIndex] or 0
+
+        -- Only populate from DB if we don't already have combat data
+        if currentAccHP == 0 then
+            local db = MobHealth3_StaticDB or {}
+            local rawData
+            
+            if targetLevel ~= -1 then
+                rawData = rawget(db, targetIndex)
+            end
+            
+            if not rawData then
+                for key, val in pairs(db) do
+                    if key == targetName or string.find(key, "^" .. targetName .. ":") then
+                        rawData = val
+                        break
+                    end
+                end
+            end
+            
+            if rawData then
+                local _, _, dbLevel, dbMax = string.find(tostring(rawData), "(%d+)/(%d+)")
+                local finalMax = tonumber(dbMax or rawData)
+                local sourceLevel = tonumber(dbLevel or targetLevel)
+                
+                if finalMax and finalMax > 100 then
+                    -- THE GUESTIMATOR
+                    if targetLevel > 0 and sourceLevel > 0 and targetLevel ~= sourceLevel then
+                        finalMax = math.floor(finalMax * (targetLevel / sourceLevel))
+                    end
+
+                    AccumulatorHP[targetIndex] = finalMax
+                    AccumulatorPerc[targetIndex] = 100
+                    currentAccHP = finalMax
+                    currentAccPerc = 100
+                end
+            end
+        end
+
+        -- PVP FIX: Raised player data retention from 10% to 100% for higher accuracy
+        local maxLimit = UnitIsPlayer("target") and 100 or 200
+        if currentAccPerc and currentAccPerc > maxLimit then
+            currentAccHP = (currentAccHP / currentAccPerc) * maxLimit
+            currentAccPerc = maxLimit
+        end 
+    else
+        currentAccHP = nil
+        currentAccPerc = nil
+    end
 end
 
 --[[
@@ -265,43 +308,86 @@ end
 --]]
 
 function MobHealth_PPP(index)
-	return MH3Cache[index] and MH3Cache[index]/100 or 0
+    return MH3Cache[index] and MH3Cache[index]/100 or 0
 end
---]]
-function MobHealth3:GetUnitHealth(unit, current, max, name, level)
+
+
+
+-- THE UNIFIED ENGINE: Optimized for 1.12 logic
+function MobHealth3:GetUnitHealth(unit, current, max, uName, uLevel)
+    if type(unit) == "table" then unit, current, max, uName, uLevel = current, max, uName, uLevel, nil end
     if not UnitExists(unit) then return 0, 0, false; end
-    current, max, name, level = current or UnitHealth(unit), max or UnitHealthMax(unit), name or UnitName(unit), level or UnitLevel(unit)
-    if level == -1 then level = 63; end
+    
+    current, max = current or UnitHealth(unit), max or UnitHealthMax(unit)
+    uName, uLevel = uName or UnitName(unit), uLevel or UnitLevel(unit)
 
-    -- Only process if the game is currently showing a 0-100 percentage
-    if max == 100 and not (UnitPlayerControlled(unit)) then 
-        local key = name..":"..level
-        local rawData = MobHealthDB[key] -- Using the Global DB name directly
-        
-        -- Guestimator Logic: If level is missing, check level+1 and scale down
-        if not rawData then
-            local nextLvlData = MobHealthDB[name..":"..(level + 1)]
-            if nextLvlData then
-                local _, _, found = string.find(tostring(nextLvlData), ".+/(%d+)")
-                local baseHP = tonumber(found or nextLvlData)
-                if baseHP then
-                    local ratio = (level < 20) and 0.88 or (level < 40 and 0.925 or 0.965)
-                    rawData = math.floor(baseHP * ratio)
-                end
-            end
-        end
+    -- 1. NPCs/Players (Pass through real numbers if max is known)
+    if max > 100 then return current, max, true end
 
-        if rawData then
-            -- Format Fix: Pull "156" out of "8/156"
-            local _, _, finalMax = string.find(tostring(rawData), ".+/(%d+)")
-            finalMax = tonumber(finalMax or rawData)
-            
-            if finalMax and finalMax > 100 then
-                -- Math: Convert percentage (current) to real health
-                local realCur = math.floor(current/100 * finalMax + 0.5)
-                return realCur, finalMax, true
+    local uKey = uName..":"..uLevel
+    local db = MobHealth3_StaticDB or {}
+    local rawData
+    
+    -- 2. Try DB Exact Match
+    if uLevel ~= -1 then
+        rawData = rawget(db, uKey)
+    end
+    
+    -- 3. Try DB Name Fallback
+    if not rawData then
+        for key, val in pairs(db) do
+            if key == uName or string.find(key, "^" .. uName .. ":") then
+                rawData = val
+                break
             end
         end
     end
+
+    -- 4. STATIC DB MATCH FOUND (Apply Guestimator)
+    if rawData then
+        local _, _, dbLevel, dbMax = string.find(tostring(rawData), "(%d+)/(%d+)")
+        local finalMax = tonumber(dbMax or rawData)
+        local sourceLevel = tonumber(dbLevel or uLevel)
+
+        if finalMax and finalMax > 100 then
+            if uLevel > 0 and sourceLevel > 0 and uLevel ~= sourceLevel then
+                finalMax = math.floor(finalMax * (uLevel / sourceLevel))
+            end
+            
+            return math.floor((current/100) * finalMax + 0.5), finalMax, true
+        end
+    end
+    
+    -- 5. ULTIMATE FALLBACK: Combat Math Estimator (For Players & Unlisted NPCs)
+    local accHP = AccumulatorHP[uKey]
+    local accPerc = AccumulatorPerc[uKey]
+    
+    if accHP and accPerc and accPerc > 0 then
+        -- ACCURACY FIX: Require a 5% drop to bypass the 1% rounding error
+        if accPerc >= 5 then
+                local estimatedMax = math.floor((accHP / accPerc) * 100 + 0.5)
+                
+                -- PLAUSIBILITY FILTER: Intercept ballooning and shrinking health
+                if UnitIsPlayer(unit) and uLevel > 0 then
+                    local sanityCap = uLevel * 130
+                    local sanityFloor = uLevel * 30 -- e.g., Level 60 * 30 = 1,800 Max HP minimum
+                    
+                    if estimatedMax > sanityCap or estimatedMax < sanityFloor then
+                        local _, targetClass = UnitClass(unit)
+                        local classMult = ClassHPMultipliers[targetClass] or 65
+                        estimatedMax = uLevel * classMult
+                    end
+                end
+
+                if estimatedMax > 100 then
+                    local estimatedCurrent = math.floor((current / 100) * estimatedMax + 0.5)
+                return estimatedCurrent, estimatedMax, true
+            end
+        else
+            -- Lock display to percentages while building confidence to prevent UI flickering
+            return current, 100, true
+        end
+    end
+
     return current, max, false
 end
