@@ -1,913 +1,1023 @@
 --[[
-    MobHealth3 - Kronos Edition (modern client)
+Name: AceEvent-2.0
+Revision: $Rev: 8887 $
+Author(s): ckknight (ckknight@gmail.com)
+	facboy (<email here>)
+Inspired By: AceEvent 1.x by Turan (<email here>)
+Website: http://www.wowace.com/
+Documentation: http://wiki.wowace.com/index.php/AceEvent-2.0
+SVN: http://svn.wowace.com/root/trunk/Ace2/AceEvent-2.0
+Description: Mixin to allow for event handling, scheduling, and inter-addon
+             communication.
+Dependencies: AceLibrary, AceOO-2.0
+]]
 
-    Maintained by Mirasu of Kronos. Modernized for the 1.14.x Classic Era
-    client while talking to a TrinityCore 1.12 server (Kronos) via proxy.
+local MAJOR_VERSION = "AceEvent-2.0"
+local MINOR_VERSION = "$Revision: 8887 $"
 
-    Kronos sends real health for friendly party/raid units, percentages for
-    everyone else. This addon fills the gap: static DB for known NPCs,
-    combat-log accumulator for players and unlisted mobs.
---]]
+if not AceLibrary then error(MAJOR_VERSION .. " requires AceLibrary") end
+if not AceLibrary:IsNewVersion(MAJOR_VERSION, MINOR_VERSION) then return end
 
--- Captured BEFORE anything else can replace these. The Luna/oUF bridge
--- below needs the real Blizzard implementations to avoid recursing into
--- its own wrappers.
-local origUnitHealth    = UnitHealth
-local origUnitHealthMax = UnitHealthMax
+if not AceLibrary:HasInstance("AceOO-2.0") then error(MAJOR_VERSION .. " requires AceOO-2.0") end
 
--- Static database (populated by Data.lua). Claim without overwriting.
-MobHealth3_StaticDB = MobHealth3_StaticDB or {}
+local AceOO = AceLibrary:GetInstance("AceOO-2.0")
+local Mixin = AceOO.Mixin
+local AceEvent = Mixin {
+						"RegisterEvent",
+						"RegisterAllEvents",
+						"UnregisterEvent",
+						"UnregisterAllEvents",
+						"TriggerEvent",
+						"ScheduleEvent",
+						"ScheduleRepeatingEvent",
+						"CancelScheduledEvent",
+						"CancelAllScheduledEvents",
+						"IsEventRegistered",
+						"IsEventScheduled",
+						"RegisterBucketEvent",
+						"UnregisterBucketEvent",
+						"UnregisterAllBucketEvents",
+						"IsBucketEventRegistered",
+					   }
 
--- Name-only index over MobHealth3_StaticDB, built lazily on first lookup.
--- The legacy fallback was a `pairs()` scan over ~10K entries with a regex
--- compiled inside the loop — fine for solo PvE, brutal at 80v80 where every
--- unlisted player and NPC triggers the full scan on every UnitHealth call
--- (potentially millions of iterations per second once you factor in Luna,
--- EasyFrames, Blizzard frames, and nameplates all calling through us).
--- This makes the name-only fallback O(1) and turns "not in DB" into a
--- single hash miss instead of 10K wasted iterations.
---
--- Lazy: Data.lua loads AFTER MobHealth3.lua per the TOC, so the table is
--- empty when this file runs. Defer the build to first lookup.
-local NameIndex
+local weakKey = {__mode="k"}
+local new, del
+do
+	local list = setmetatable({}, weakKey)
+	function new()
+		local t = next(list)
+		if t then
+			list[t] = nil
+			return t
+		else
+			return {}
+		end
+	end
 
-local function lookupByName(name)
-    if not name then return nil end
-    if not NameIndex then
-        NameIndex = {}
-        for key, val in pairs(MobHealth3_StaticDB) do
-            local nameOnly = string.match(key, "^([^:]+)")
-            if nameOnly and not NameIndex[nameOnly] then
-                NameIndex[nameOnly] = val
-            end
-        end
-    end
-    return NameIndex[name]
+	function del(t)
+		setmetatable(t, nil)
+		for k in pairs(t) do
+			t[k] = nil
+		end
+		list[t] = true
+	end
 end
 
--- Persisted snapshots of converged accumulator estimates, keyed by
--- "name:level". Loaded once per session; updated as the accumulator finds
--- (or refutes) values during combat.
-MobHealth3SavedDB           = MobHealth3SavedDB or {}
-MobHealth3SavedDB.estimates = MobHealth3SavedDB.estimates or {}
+local FAKE_NIL
+local RATE
 
-local MH3Cache         = {}
-local AccumulatorHP    = {}
-local AccumulatorPerc  = {}
-
-local currentAccHP, currentAccPerc
-local targetName, targetLevel, targetGUID, targetIndex
-local recentDamage, recentHealing = 0, 0
-local startPercent, lastPercent = 100, 100
-
--- Per-class baseline HP-per-level for the Plausibility Filter
-local ClassHPMultipliers = {
-    MAGE = 55, PRIEST = 60, ROGUE = 65, HUNTER = 70, DRUID = 70,
-    SHAMAN = 75, PALADIN = 80, WARLOCK = 80, WARRIOR = 90,
+local eventsWhichHappenOnce = {
+	PLAYER_LOGIN = true,
+	AceEvent_FullyInitialized = true,
+	VARIABLES_LOADED = true,
+	PLAYER_LOGOUT = true,
 }
 
--- Legacy MobHealth/MobHealth2 read contract: lookup by "name:level" with
--- fallbacks, return a "max/100" string so callers can extract the max HP.
-local compatMT = {
-    __index = function(t, k)
-        local val = rawget(t, k)
-                 or rawget(t, string.gsub(tostring(k), ":%d+$", ":63"))
-                 or rawget(t, string.gsub(tostring(k), ":%d+$", ""))
-        if val then
-            local _, _, health = string.find(tostring(val), ".+/(%d+)")
-            return (health or val) .. "/100"
-        end
-    end,
-}
+local registeringFromAceEvent
+function AceEvent:RegisterEvent(event, method, once)
+	AceEvent:argCheck(event, 2, "string")
+	if self == AceEvent and not registeringFromAceEvent then
+		AceEvent:argCheck(method, 3, "function")
+		self = method
+	else
+		AceEvent:argCheck(method, 3, "string", "function", "nil", "boolean", "number")
+		if type(method) == "boolean" or type(method) == "number" then
+			AceEvent:argCheck(once, 4, "nil")
+			once, method = method, event
+		end
+	end
+	AceEvent:argCheck(once, 4, "number", "boolean", "nil")
+	if eventsWhichHappenOnce[event] then
+		once = true
+	end
+	local throttleRate
+	if type(once) == "number" then
+		throttleRate, once = once
+	end
+	if not method then
+		method = event
+	end
+	if type(method) == "string" and type(self[method]) ~= "function" then
+		AceEvent:error("Cannot register event %q to method %q, it does not exist", event, method)
+	end
 
-MobHealthDB  = setmetatable(MobHealth3_StaticDB, compatMT)
-MobHealth3DB = MobHealthDB
+	local AceEvent_registry = AceEvent.registry
+	if not AceEvent_registry[event] then
+		AceEvent_registry[event] = new()
+		AceEvent.frame:RegisterEvent(event)
+	end
 
-if pfUI and pfUI.api then
-    pfUI.api.libmobhealth = MobHealthDB
+	local remember = true
+	if AceEvent_registry[event][self] then
+		remember = false
+	end
+	AceEvent_registry[event][self] = method
+
+	local AceEvent_onceRegistry = AceEvent.onceRegistry
+	if once then
+		if not AceEvent_onceRegistry then
+			AceEvent.onceRegistry = new()
+			AceEvent_onceRegistry = AceEvent.onceRegistry
+		end
+		if not AceEvent_onceRegistry[event] then
+			AceEvent_onceRegistry[event] = new()
+		end
+		AceEvent_onceRegistry[event][self] = true
+	else
+		if AceEvent_onceRegistry and AceEvent_onceRegistry[event] then
+			AceEvent_onceRegistry[event][self] = nil
+			if not next(AceEvent_onceRegistry[event]) then
+				AceEvent_onceRegistry[event] = del(AceEvent_onceRegistry[event])
+			end
+		end
+	end
+
+	local AceEvent_throttleRegistry = AceEvent.throttleRegistry
+	if throttleRate then
+		if not AceEvent_throttleRegistry then
+			AceEvent.throttleRegistry = new()
+			AceEvent_throttleRegistry = AceEvent.throttleRegistry
+		end
+		if not AceEvent_throttleRegistry[event] then
+			AceEvent_throttleRegistry[event] = new()
+		end
+		if AceEvent_throttleRegistry[event][self] then
+			AceEvent_throttleRegistry[event][self] = del(AceEvent_throttleRegistry[event][self])
+		end
+		AceEvent_throttleRegistry[event][self] = setmetatable(new(), weakKey)
+		local t = AceEvent_throttleRegistry[event][self]
+		t[RATE] = throttleRate
+	else
+		if AceEvent_throttleRegistry and AceEvent_throttleRegistry[event] then
+			if AceEvent_throttleRegistry[event][self] then
+				AceEvent_throttleRegistry[event][self] = del(AceEvent_throttleRegistry[event][self])
+			end
+			if not next(AceEvent_throttleRegistry[event]) then
+				AceEvent_throttleRegistry[event] = del(AceEvent_throttleRegistry[event])
+			end
+		end
+	end
+
+	if remember then
+		AceEvent:TriggerEvent("AceEvent_EventRegistered", self, event)
+	end
 end
 
--- Sniff frame: legacy addons probe for this name to detect MH/MH2/MI2.
-CreateFrame("Frame", "MobHealthFrame")
+local ALL_EVENTS
 
-function GetMH3Cache() return MH3Cache end
+function AceEvent:RegisterAllEvents(method)
+	if self == AceEvent then
+		AceEvent:argCheck(method, 1, "function")
+		self = method
+	else
+		AceEvent:argCheck(method, 1, "string", "function")
+		if type(method) == "string" and type(self[method]) ~= "function" then
+			AceEvent:error("Cannot register all events to method %q, it does not exist", method)
+		end
+	end
 
-local MobHealth3 = CreateFrame("Frame", "MobHealth3Frame")
-_G.MobHealth3 = MobHealth3
+	if not AceEvent.registry[ALL_EVENTS] then
+		AceEvent.registry[ALL_EVENTS] = new()
+		AceEvent.frame:RegisterAllEvents()
+	end
 
--- Kronos sends real HP only for units in your party/raid (and yourself/pet).
--- Everyone else (target, mouseover, nameplates, enemy players, NPCs) comes
--- through as a 0..100 percentage with UnitHealthMax ≈ 100. Distinguish by
--- unit token, not by the max value — a percentage unit at full HP looks
--- identical to a friendly with real max=100, so value-based heuristics fail.
---
--- Indirect tokens (`target`, `mouseover`, `focus`) need a second check:
--- if your target IS yourself / your pet / a party member, the server still
--- sends real HP for it. Without UnitIsUnit/UnitInParty fallback we'd route
--- self-targets through the estimator and produce garbage like "60 / 80".
-local function isFriendlyRealUnit(unit)
-    if not unit then return false end
-    if unit == "player" or unit == "pet" or unit == "vehicle" then return true end
-    if string.find(unit, "^party") or string.find(unit, "^raid") then return true end
-    if UnitIsUnit(unit, "player") or UnitIsUnit(unit, "pet") then return true end
-    if UnitInParty(unit) or UnitInRaid(unit) then return true end
-    return false
+	AceEvent.registry[ALL_EVENTS][self] = method
 end
 
-----------------------------------------------------------------
--- The unified engine
-----------------------------------------------------------------
-function MobHealth3:GetUnitHealth(unit, current, max, uName, uLevel)
-    if type(unit) == "table" then
-        unit, current, max, uName, uLevel = current, max, uName, uLevel, nil
-    end
-    if not UnitExists(unit) then return 0, 0, false end
+local _G = getfenv(0)
+local memstack, timestack = {}, {}
+local memdiff, timediff
+function AceEvent:TriggerEvent(event, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20)
+	AceEvent:argCheck(event, 2, "string")
+	local AceEvent_registry = AceEvent.registry
+	if (not AceEvent_registry[event] or not next(AceEvent_registry[event])) and (not AceEvent_registry[ALL_EVENTS] or not next(AceEvent_registry[ALL_EVENTS])) then
+		return
+	end
+	local _G_event = _G.event
+	_G.event = event
 
-    -- Always read raw values from the server, not our bridged wrapper.
-    -- Otherwise the global override would loop us back through the estimator.
-    current = current or origUnitHealth(unit)
-    max     = max     or origUnitHealthMax(unit)
-    uName   = uName   or UnitName(unit)
-    uLevel  = uLevel  or UnitLevel(unit)
+	local AceEvent_onceRegistry = AceEvent.onceRegistry
+	local AceEvent_debugTable = AceEvent.debugTable
+	if AceEvent_onceRegistry and AceEvent_onceRegistry[event] then
+		local tmp = new()
+		for obj, method in pairs(AceEvent_onceRegistry[event]) do
+			tmp[obj] = AceEvent_registry[event] and AceEvent_registry[event][obj] or nil
+		end
+		local obj = next(tmp)
+		while obj do
+			local mem, time
+			if AceEvent_debugTable then
+				if not AceEvent_debugTable[event] then
+					AceEvent_debugTable[event] = new()
+				end
+				if not AceEvent_debugTable[event][obj] then
+					AceEvent_debugTable[event][obj] = new()
+					AceEvent_debugTable[event][obj].mem = 0
+					AceEvent_debugTable[event][obj].time = 0
+					AceEvent_debugTable[event][obj].count = 0
+				end
+				if memdiff then
+					table.insert(memstack, memdiff)
+					table.insert(timestack, timediff)
+				end
+				memdiff, timediff = 0, 0
+				mem, time = gcinfo(), GetTime()
+			end
+			local method = tmp[obj]
+			AceEvent.UnregisterEvent(obj, event)
+			if type(method) == "string" then
+				local obj_method = obj[method]
+				if obj_method then
+					obj_method(obj, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20)
+				end
+			elseif method then -- function
+				method(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20)
+			end
+			if AceEvent_debugTable then
+				local dmem, dtime = memdiff, timediff
+				mem, time = gcinfo() - mem - memdiff, GetTime() - time - timediff
+				AceEvent_debugTable[event][obj].mem = AceEvent_debugTable[event][obj].mem + mem
+				AceEvent_debugTable[event][obj].time = AceEvent_debugTable[event][obj].time + time
+				AceEvent_debugTable[event][obj].count = AceEvent_debugTable[event][obj].count + 1
 
-    -- Server gave real values: pass through. Only friendly party/raid units
-    -- get real HP from Kronos; everyone else comes through as 0..100 with
-    -- max≈100, so we can't distinguish by value alone.
-    if isFriendlyRealUnit(unit) then return current, max, true end
+				memdiff, timediff = table.remove(memstack), table.remove(timestack)
+				if memdiff then
+					memdiff = memdiff + mem + dmem
+					timediff = timediff + time + dtime
+				end
+			end
+			tmp[obj] = nil
+			obj = next(tmp)
+		end
+		del(tmp)
+	end
 
-    local uKey = uName .. ":" .. uLevel
-    local db   = MobHealth3_StaticDB
-    local rawData
+	local AceEvent_throttleRegistry = AceEvent.throttleRegistry
+	local throttleTable = AceEvent_throttleRegistry and AceEvent_throttleRegistry[event]
+	if AceEvent_registry[event] then
+		local tmp = new()
+		for obj, method in pairs(AceEvent_registry[event]) do
+			tmp[obj] = method
+		end
+		local obj = next(tmp)
+		while obj do
+			local method = tmp[obj]
+			local continue = false
+			if throttleTable and throttleTable[obj] then
+				local a1 = a1
+				if a1 == nil then
+					a1 = FAKE_NIL
+				end
+				if not throttleTable[obj][a1] or GetTime() - throttleTable[obj][a1] >= throttleTable[obj][RATE] then
+					throttleTable[obj][a1] = GetTime()
+				else
+					continue = true
+				end
+			end
+			if not continue then
+				local mem, time
+				if AceEvent_debugTable then
+					if not AceEvent_debugTable[event] then
+						AceEvent_debugTable[event] = new()
+					end
+					if not AceEvent_debugTable[event][obj] then
+						AceEvent_debugTable[event][obj] = new()
+						AceEvent_debugTable[event][obj].mem = 0
+						AceEvent_debugTable[event][obj].time = 0
+						AceEvent_debugTable[event][obj].count = 0
+					end
+					if memdiff then
+						table.insert(memstack, memdiff)
+						table.insert(timestack, timediff)
+					end
+					memdiff, timediff = 0, 0
+					mem, time = gcinfo(), GetTime()
+				end
+				if type(method) == "string" then
+					local obj_method = obj[method]
+					if obj_method then
+						obj_method(obj, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20)
+					end
+				elseif method then -- function
+					method(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20)
+				end
+				if AceEvent_debugTable then
+					local dmem, dtime = memdiff, timediff
+					mem, time = gcinfo() - mem - memdiff, GetTime() - time - timediff
+					AceEvent_debugTable[event][obj].mem = AceEvent_debugTable[event][obj].mem + mem
+					AceEvent_debugTable[event][obj].time = AceEvent_debugTable[event][obj].time + time
+					AceEvent_debugTable[event][obj].count = AceEvent_debugTable[event][obj].count + 1
 
-    if uLevel ~= -1 then
-        rawData = rawget(db, uKey)
-    end
-    if not rawData then
-        rawData = lookupByName(uName)
-    end
+					memdiff, timediff = table.remove(memstack), table.remove(timestack)
+					if memdiff then
+						memdiff = memdiff + mem + dmem
+						timediff = timediff + time + dtime
+					end
+				end
+			end
+			tmp[obj] = nil
+			obj = next(tmp)
+		end
+		del(tmp)
+	end
+	if AceEvent_registry[ALL_EVENTS] then
+		local tmp = new()
+		for obj, method in pairs(AceEvent_registry[ALL_EVENTS]) do
+			tmp[obj] = method
+		end
+		local obj = next(tmp)
+		while obj do
+			local method = tmp[obj]
+			local mem, time
+			if AceEvent_debugTable then
+				if not AceEvent_debugTable[event] then
+					AceEvent_debugTable[event] = new()
+				end
+				if not AceEvent_debugTable[event][obj] then
+					AceEvent_debugTable[event][obj] = new()
+					AceEvent_debugTable[event][obj].mem = 0
+					AceEvent_debugTable[event][obj].time = 0
+					AceEvent_debugTable[event][obj].count = 0
+				end
+				if memdiff then
+					table.insert(memstack, memdiff)
+					table.insert(timestack, timediff)
+				end
+				memdiff, timediff = 0, 0
+				mem, time = gcinfo(), GetTime()
+			end
+			if type(method) == "string" then
+				local obj_method = obj[method]
+				if obj_method then
+					obj_method(obj, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20)
+				end
+			elseif method then -- function
+				method(a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20)
+			end
+			if AceEvent_debugTable then
+				local dmem, dtime = memdiff, timediff
+				mem, time = gcinfo() - mem - memdiff, GetTime() - time - timediff
+				AceEvent_debugTable[event][obj].mem = AceEvent_debugTable[event][obj].mem + mem
+				AceEvent_debugTable[event][obj].time = AceEvent_debugTable[event][obj].time + time
+				AceEvent_debugTable[event][obj].count = AceEvent_debugTable[event][obj].count + 1
 
-    if rawData then
-        local _, _, dbLevel, dbMax = string.find(tostring(rawData), "(%d+)/(%d+)")
-        local finalMax    = tonumber(dbMax or rawData)
-        local sourceLevel = tonumber(dbLevel or uLevel)
-
-        if finalMax and finalMax > 50 then
-            if uLevel > 0 and sourceLevel > 0 and uLevel ~= sourceLevel then
-                finalMax = math.floor(finalMax * (uLevel / sourceLevel))
-            end
-            return math.floor((current/100) * finalMax + 0.5), finalMax, true
-        end
-    end
-
-    -- Combat-derived estimator (players & unlisted NPCs).
-    -- Three sources, in order of trust:
-    --   1. Fresh accumulator with accPerc >= 5  → strong, overrides snapshot
-    --   2. Saved snapshot from a prior session  → instant "good guess" while
-    --      this session's accumulator builds up; gets refuted/replaced once
-    --      fresh data accumulates past the divergence threshold
-    --   3. Low-confidence percentage fallback   → no real data yet
-    local accHP   = AccumulatorHP[uKey]
-    local accPerc = AccumulatorPerc[uKey]
-    local saved   = MobHealth3SavedDB.estimates[uKey]
-
-    local estimatedMax
-    local fromAccumulator = false
-
-    if accHP and accPerc and accPerc >= 5 then
-        estimatedMax    = math.floor((accHP / accPerc) * 100 + 0.5)
-        fromAccumulator = true
-    elseif saved and saved > 50 then
-        estimatedMax = saved
-    end
-
-    if estimatedMax then
-        if UnitIsPlayer(unit) and uLevel > 0 then
-            local sanityCap   = uLevel * 130
-            local sanityFloor = uLevel * 30
-            if estimatedMax > sanityCap or estimatedMax < sanityFloor then
-                local _, class = UnitClass(unit)
-                estimatedMax = uLevel * (ClassHPMultipliers[class] or 65)
-            end
-        end
-
-        if estimatedMax > 50 then
-            -- Persist the fresh estimate. Update if it's new, or if the
-            -- saved snapshot is stale by >25% (gear change, level-up,
-            -- talent respec — common in PvP). Small drift gets coalesced
-            -- to avoid SV churn from per-frame ratio noise.
-            if fromAccumulator then
-                local diff = saved and math.abs(estimatedMax - saved) / saved or 1
-                if not saved or diff > 0.05 then
-                    MobHealth3SavedDB.estimates[uKey] = estimatedMax
-                end
-            end
-
-            local estimatedCurrent = math.floor((current/100) * estimatedMax + 0.5)
-            MH3Cache[uKey] = estimatedMax
-            return estimatedCurrent, estimatedMax, true
-        end
-    end
-
-    -- Have *some* fresh data but not enough yet → percentage fallback.
-    if accHP and accPerc and accPerc > 0 then
-        return current, 100, true
-    end
-
-    return current, max, false
+				memdiff, timediff = table.remove(memstack), table.remove(timestack)
+				if memdiff then
+					memdiff = memdiff + mem + dmem
+					timediff = timediff + time + dtime
+				end
+			end
+			tmp[obj] = nil
+			obj = next(tmp)
+		end
+		del(tmp)
+	end
+	_G.event = _G_event
 end
 
-----------------------------------------------------------------
--- Accumulator: each percent the target loses, attribute the damage we saw
--- since the last tick. accHP / accPerc * 100 = estimated max.
-----------------------------------------------------------------
-local function calculateMaxHealth(current, max)
-    if current == 0 then return end  -- target dead
+--------------------
+-- schedule heap management
+--------------------
 
-    -- Resurrect / transform anomaly — re-baseline.
-    if startPercent > 100 then
-        startPercent = current
-        lastPercent  = current
-        recentDamage, recentHealing = 0, 0
-        return
-    end
+-- local accessors
+local getn = table.getn
+local setn = table.setn
+local tinsert = table.insert
+local tremove = table.remove
+local floor = math.floor
 
-    local deltaPerc  = lastPercent - current      -- + = HP went down
-    local netChange  = recentDamage - recentHealing  -- + = HP went down
-    if deltaPerc == 0 then return end
+--------------------
+-- sifting functions
+local function hSiftUp(heap, pos, schedule)
+	schedule = schedule or heap[pos]
+	local scheduleTime = schedule.time
 
-    -- HP changed but we tracked nothing for this target (damage from a
-    -- source we don't see, or events we filtered out). Don't pollute
-    -- the accumulator — just re-baseline lastPercent.
-    if netChange == 0 then
-        lastPercent = current
-        return
-    end
-
-    -- Signs must agree: tracked damage requires HP to drop, tracked heal
-    -- requires HP to rise. Disagreement means our visibility is incomplete
-    -- (e.g., tracked a tiny heal but they got bombed by a DOT we missed).
-    -- Discard the sample rather than corrupt the ratio.
-    if (netChange > 0) ~= (deltaPerc > 0) then
-        recentDamage, recentHealing = 0, 0
-        lastPercent = current
-        return
-    end
-
-    currentAccHP   = currentAccHP   + math.abs(netChange)
-    currentAccPerc = currentAccPerc + math.abs(deltaPerc)
-    recentDamage, recentHealing = 0, 0
-    lastPercent = current
-
-    AccumulatorHP[targetIndex]   = currentAccHP
-    AccumulatorPerc[targetIndex] = currentAccPerc
+	local curr, i = pos, floor(pos/2)
+	local parent = heap[i]
+	while i > 0 and scheduleTime < parent.time do
+		heap[curr], parent.i = parent, curr
+		curr, i = i, floor(i/2)
+		parent = heap[i]
+	end
+	heap[curr], schedule.i = schedule, curr
+	return pos ~= curr
 end
 
-----------------------------------------------------------------
--- Target switching: seed accumulators from static DB or session memory.
-----------------------------------------------------------------
-local function onTargetChanged()
-    -- UnitCanAttack covers hostile mobs, enemy-faction players, AND duel
-    -- partners (same-faction but temporarily attackable). Plain
-    -- `not UnitIsFriend(...)` excludes duel partners since they remain same
-    -- faction; the accumulator would never build for them.
-    if UnitExists("target") and not UnitIsDead("target") and UnitCanAttack("player", "target") then
-        targetName  = UnitName("target")
-        targetLevel = UnitLevel("target")
-        targetGUID  = UnitGUID("target")
-        targetIndex = string.format("%s:%d", targetName, targetLevel)
+local function hSiftDown(heap, pos, schedule, size)
+	schedule, size = schedule or heap[pos], size or getn(heap)
+	local scheduleTime = schedule.time
 
-        recentDamage, recentHealing = 0, 0
-        -- Raw percentage for the estimator baseline.
-        startPercent = origUnitHealth("target")
-        lastPercent  = startPercent
-
-        currentAccHP   = AccumulatorHP[targetIndex]   or 0
-        currentAccPerc = AccumulatorPerc[targetIndex] or 0
-
-        if currentAccHP == 0 then
-            local db = MobHealth3_StaticDB
-            local rawData
-
-            if targetLevel ~= -1 then
-                rawData = rawget(db, targetIndex)
-            end
-            if not rawData then
-                rawData = lookupByName(targetName)
-            end
-
-            if rawData then
-                local _, _, dbLevel, dbMax = string.find(tostring(rawData), "(%d+)/(%d+)")
-                local finalMax    = tonumber(dbMax or rawData)
-                local sourceLevel = tonumber(dbLevel or targetLevel)
-
-                if finalMax and finalMax > 50 then
-                    if targetLevel > 0 and sourceLevel > 0 and targetLevel ~= sourceLevel then
-                        finalMax = math.floor(finalMax * (targetLevel / sourceLevel))
-                    end
-                    AccumulatorHP[targetIndex]   = finalMax
-                    AccumulatorPerc[targetIndex] = 100
-                    currentAccHP, currentAccPerc = finalMax, 100
-                end
-            end
-        end
-
-        -- Cap retained sample so a long-running target doesn't drown out new data.
-        local maxLimit = UnitIsPlayer("target") and 100 or 200
-        if currentAccPerc and currentAccPerc > maxLimit then
-            currentAccHP   = (currentAccHP / currentAccPerc) * maxLimit
-            currentAccPerc = maxLimit
-        end
-    else
-        currentAccHP, currentAccPerc, targetGUID = nil, nil, nil
-    end
+	local curr = pos
+	repeat
+		local child, childTime, c
+		-- determine the child to compare with
+		local j = 2 * curr
+		if j > size then
+			break
+		end
+		local k = j + 1
+		if k > size then
+			child = heap[j]
+			childTime, c = child.time, j
+		else
+			local childj, childk = heap[j], heap[k]
+			local jTime, kTime = childj.time, childk.time
+			if jTime < kTime then
+				child, childTime, c = childj, jTime, j
+			else
+				child, childTime, c = childk, kTime, k
+			end
+		end
+		-- do the comparison
+		if scheduleTime <= childTime then
+			break
+		end
+		heap[curr], child.i = child, curr
+		curr = c
+	until false
+	heap[curr], schedule.i = schedule, curr
+	return pos ~= curr
 end
 
-----------------------------------------------------------------
--- Combat log: tally damage dealt to current target. Modern API, no string parsing.
-----------------------------------------------------------------
-local function onCombatLogEvent()
-    if not currentAccHP or not targetGUID then return end
-
-    -- Capture enough args to read overkill/absorbed for every event variant.
-    -- SWING_DAMAGE:        a12 amount, a13 overkill, a17 absorbed
-    -- SPELL_*_DAMAGE etc.: a15 amount, a16 overkill, a20 absorbed
-    -- ENVIRONMENTAL:       a13 amount, a14 overkill, a18 absorbed
-    -- SPELL_HEAL:          a15 amount, a16 overhealing, a17 absorbed
-    local _, subevent, _, _, _, _, _,
-          destGUID, _, _, _,
-          a12, a13, a14, a15, a16, a17, a18, _, a20 = CombatLogGetCurrentEventInfo()
-
-    if destGUID ~= targetGUID then return end
-
-    local amount, overkill, absorbed = 0, 0, 0
-    local isHeal = false
-
-    if subevent == "SWING_DAMAGE" then
-        amount   = a12 or 0
-        overkill = math.max(a13 or 0, 0)
-        absorbed = a17 or 0
-    elseif subevent == "ENVIRONMENTAL_DAMAGE" then
-        amount   = a13 or 0
-        overkill = math.max(a14 or 0, 0)
-        absorbed = a18 or 0
-    elseif subevent == "SPELL_DAMAGE"
-        or subevent == "SPELL_PERIODIC_DAMAGE"
-        or subevent == "RANGE_DAMAGE"
-        or subevent == "DAMAGE_SHIELD"
-        or subevent == "DAMAGE_SPLIT" then
-        amount   = a15 or 0
-        overkill = math.max(a16 or 0, 0)
-        absorbed = a20 or 0
-    elseif subevent == "SPELL_HEAL" or subevent == "SPELL_PERIODIC_HEAL" then
-        -- Heals on the target. a16 is overhealing in this slot.
-        amount   = a15 or 0
-        overkill = math.max(a16 or 0, 0)
-        absorbed = a17 or 0
-        isHeal = true
-    end
-
-    -- effective = HP actually moved (damage past mitigation, or heal past
-    -- overheal/absorb). Absorbs and overkill are both "wasted" relative to
-    -- the HP bar, so subtracting them prevents PvP shield-users from
-    -- inflating the estimate and stops the killing blow from doing the same.
-    local effective = amount - overkill - absorbed
-    if effective <= 0 then return end
-
-    if isHeal then
-        recentHealing = recentHealing + effective
-    else
-        recentDamage  = recentDamage  + effective
-    end
+--------------------
+-- heap functions
+local function hMaintain(heap, pos, schedule, size)
+	schedule, size = schedule or heap[pos], size or getn(heap)
+	if not hSiftUp(heap, pos, schedule) then
+		hSiftDown(heap, pos, schedule, size)
+	end
 end
 
-----------------------------------------------------------------
--- Event dispatch
-----------------------------------------------------------------
--- Forward decl so the OnEvent closure can see the bridge installer
--- that's defined further down (Lua locals must be declared before use).
-local installBridges
-
-MobHealth3:RegisterEvent("PLAYER_LOGIN")
-MobHealth3:RegisterEvent("PLAYER_TARGET_CHANGED")
-MobHealth3:RegisterEvent("UNIT_HEALTH")
-MobHealth3:RegisterEvent("COMBAT_LOG_EVENT_UNFILTERED")
-
-MobHealth3:SetScript("OnEvent", function(self, event, arg1)
-    if event == "PLAYER_TARGET_CHANGED" then
-        onTargetChanged()
-    elseif event == "UNIT_HEALTH" then
-        if arg1 == "target" and currentAccHP ~= nil then
-            -- Estimator math needs raw 0..100 percentages, not bridged values.
-            calculateMaxHealth(origUnitHealth("target"), origUnitHealthMax("target"))
-        end
-    elseif event == "COMBAT_LOG_EVENT_UNFILTERED" then
-        onCombatLogEvent()
-    elseif event == "PLAYER_LOGIN" then
-        DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00MobHealth3:|r Kronos edition loaded.")
-        -- Permanently neutralize the diagnostic overlay from older versions.
-        -- It's an unnamed OVERLAY-layer FontString parented somewhere under
-        -- TargetFrame. Hide() alone gets undone by some upstream code on
-        -- the next frame, so layer multiple defenses: empty the text, set
-        -- alpha to 0, shrink to 1×1, and re-anchor far offscreen. Even if
-        -- something Shows() it again it has nothing visible to display.
-        -- EasyFrames' TextString is on the ARTWORK layer so it's untouched.
-        local function killOverlayOrphans(frame, depth)
-            if depth > 6 then return end
-            if frame.GetRegions then
-                for _, region in ipairs({frame:GetRegions()}) do
-                    if region.GetObjectType
-                       and region:GetObjectType() == "FontString"
-                       and not region:GetName()
-                       and region.GetDrawLayer
-                       and region:GetDrawLayer() == "OVERLAY" then
-                        local txt = region:GetText() or ""
-                        if txt:find("/") then
-                            region:SetText("")
-                            region:SetAlpha(0)
-                            region:SetWidth(1)
-                            region:SetHeight(1)
-                            region:ClearAllPoints()
-                            region:SetPoint("CENTER", UIParent, "BOTTOMLEFT", -9999, -9999)
-                            region:Hide()
-                        end
-                    end
-                end
-            end
-            if frame.GetChildren then
-                for _, child in ipairs({frame:GetChildren()}) do
-                    killOverlayOrphans(child, depth + 1)
-                end
-            end
-        end
-        if TargetFrame then killOverlayOrphans(TargetFrame, 0) end
-
-        -- Also neutralize the named MobHealth3TargetText FontString from
-        -- previous versions that experimented with a centered overlay on
-        -- the bar. EasyFrames provides target numbers when the user has
-        -- Blizzard's status text option enabled — we don't want to double
-        -- them up.
-        if _G.MobHealth3TargetText then
-            _G.MobHealth3TargetText:SetText("")
-            _G.MobHealth3TargetText:SetAlpha(0)
-            _G.MobHealth3TargetText:Hide()
-        end
-
-        installBridges()
-    end
-end)
-
--- No OnUpdate by design. We previously force-synced TargetFrameHealthBar's
--- range/value and Blizzard nameplate bars from a 5/sec OnUpdate, but those
--- insecure writes tainted the TargetFrame chain — Blizzard's stock
--- TargetFrame_OnUpdate propagates that taint into TargetofTarget_Update
--- and the protected TargetFrameToT:Show() gets blocked, breaking ToT.
--- Bar fills end up correct anyway because the bridge keeps cur/max in
--- proportion whether max is 100 (raw percentage) or 4800 (estimated real),
--- and frame addons read UnitHealth via the global override for text.
-
-----------------------------------------------------------------
--- Legacy public API (MobHealth / MobHealth2 contracts)
-----------------------------------------------------------------
-function MobHealth_GetTargetMaxHP()
-    local _, m, found = MobHealth3:GetUnitHealth("target")
-    return found and m or nil
+local function hPush(heap, schedule)
+	tinsert(heap, schedule)
+	hSiftUp(heap, getn(heap), schedule)
 end
 
-function MobHealth_GetTargetCurHP()
-    local c, _, found = MobHealth3:GetUnitHealth("target")
-    return found and c or nil
+local function hPop(heap)
+	local head, tail = heap[1], tremove(heap)
+	local size = getn(heap)
+
+	if size == 1 then
+		heap[1], tail.i = tail, 1
+	elseif size > 1 then
+		hSiftDown(heap, 1, tail, size)
+	end
+	return head
 end
 
-function MobHealth_PPP(index)
-    return MH3Cache[index] and MH3Cache[index]/100 or 0
+local function hDelete(heap, pos)
+	local size = getn(heap)
+	local tail = tremove(heap)
+	if pos < size then
+		size = size - 1
+		if size == 1 then
+			heap[1], tail.i = tail, 1
+		elseif size > 1 then
+			heap[pos] = tail
+			hMaintain(heap, pos, tail, size)
+		end
+	end
 end
 
-----------------------------------------------------------------
--- Bridge: route the world's UnitHealth/UnitHealthMax calls through us.
---
--- Strategy: replace _G.UnitHealth / _G.UnitHealthMax with wrappers that
--- short-circuit when the server already provided real values (max > 50)
--- and otherwise route through MobHealth3:GetUnitHealth for an estimate.
--- Threshold is 50 (not 100) because low-level mobs have real maxes well
--- under 100 (e.g. level-1 critters around 42 HP).
---
--- This single global override fixes:
---   * Default Blizzard frames (TargetFrame, etc.)
---   * EasyFrames text formats (calls UnitHealth inside Utils.UpdateHealthValues)
---   * Kui nameplates and any other addon reading UnitHealth
---   * oUF's loadstring'd tags (perhp, missinghp) via _PROXY's __index = _G
---
--- Direct C-function references captured into local tables (notably
--- oUF's curhp/maxhp at tags.lua:371-373) are NOT affected by global
--- replacement, so we still patch those entries explicitly below.
-----------------------------------------------------------------
-local function bridgedHealth(unit)
-    if not unit or not UnitExists(unit) then return 0 end
-    local cur = origUnitHealth(unit)
-    local max = origUnitHealthMax(unit)
-    if isFriendlyRealUnit(unit) then return cur end
-    local c, m, found = MobHealth3:GetUnitHealth(unit, cur, max)
-    if found and m > 50 then return c end
-    return cur
+local GetTime = GetTime
+local delayRegistry
+local delayHeap
+local function OnUpdate()
+	local t = GetTime()
+	-- peek at top of heap
+	local v = delayHeap[1]
+	local v_time = v and v.time
+	while v and v_time <= t do
+		local v_repeatDelay = v.repeatDelay
+		if v_repeatDelay then
+			-- use the event time, not the current time, else timing inaccuracies add up over time
+			v.time = v_time + v_repeatDelay
+			-- re-arrange the heap
+			hSiftDown(delayHeap, 1, v)
+		else
+			-- pop the event off the heap, and delete it from the registry
+			hPop(delayHeap)
+			delayRegistry[v.id] = nil
+		end
+		local event = v.event
+		if type(event) == "function" then
+			event(unpack(v))
+		else
+			AceEvent:TriggerEvent(event, unpack(v))
+		end
+		if not v_repeatDelay then
+			del(v)
+		end
+		v = delayHeap[1]
+		v_time = v and v.time
+	end
+	if not v then
+		AceEvent.frame:Hide()
+	end
 end
 
-local function bridgedHealthMax(unit)
-    if not unit or not UnitExists(unit) then return 0 end
-    local cur = origUnitHealth(unit)
-    local max = origUnitHealthMax(unit)
-    if isFriendlyRealUnit(unit) then return max end
-    local c, m, found = MobHealth3:GetUnitHealth(unit, cur, max)
-    if found and m > 50 then return m end
-    return max
+local function ScheduleEvent(self, repeating, event, delay, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20)
+	local id
+	if type(event) == "string" or type(event) == "table" then
+		if type(event) == "table" then
+			if not delayRegistry or not delayRegistry[event] then
+				AceEvent:error("Bad argument #2 to `ScheduleEvent'. Improper id table fed in.")
+			end
+		end
+		if type(delay) ~= "number" then
+			id, event, delay, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20 = event, delay, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20
+			AceEvent:argCheck(event, 3, "string", "function", --[[ so message is right ]] "number")
+			AceEvent:argCheck(delay, 4, "number")
+			self:CancelScheduledEvent(id)
+		end
+	else
+		AceEvent:argCheck(event, 2, "string", "function")
+		AceEvent:argCheck(delay, 3, "number")
+	end
+
+	if not delayRegistry then
+		AceEvent.delayRegistry = new()
+		AceEvent.delayHeap = new()
+		AceEvent.delayHeap.n = 0
+		delayRegistry = AceEvent.delayRegistry
+		delayHeap = AceEvent.delayHeap
+		AceEvent.frame:SetScript("OnUpdate", OnUpdate)
+	end
+	local t
+	if type(id) == "table" then
+		for k in pairs(id) do
+			id[k] = nil
+		end
+		table.setn(id, 0)
+		t = id
+	else
+		t = new()
+	end
+	t.n = 0
+	tinsert(t, a1)
+	tinsert(t, a2)
+	tinsert(t, a3)
+	tinsert(t, a4)
+	tinsert(t, a5)
+	tinsert(t, a6)
+	tinsert(t, a7)
+	tinsert(t, a8)
+	tinsert(t, a9)
+	tinsert(t, a10)
+	tinsert(t, a11)
+	tinsert(t, a12)
+	tinsert(t, a13)
+	tinsert(t, a14)
+	tinsert(t, a15)
+	tinsert(t, a16)
+	tinsert(t, a17)
+	tinsert(t, a18)
+	tinsert(t, a19)
+	tinsert(t, a20)
+	t.event = event
+	t.time = GetTime() + delay
+	t.self = self
+	t.id = id or t
+	t.repeatDelay = repeating and delay
+	delayRegistry[t.id] = t
+	-- insert into heap
+	hPush(delayHeap, t)
+	AceEvent.frame:Show()
+	return t.id
 end
 
--- Per-function patcher. Replaces UnitHealth / UnitHealthMax inside one
--- specific function via setfenv, so callers of that function see bridged
--- values without us touching the global table. The wrapping metatable
--- delegates everything else (other globals, locals) to the original env.
-local function patchAddonFunc(fn)
-    if type(fn) ~= "function" then return end
-    local env = getfenv(fn)
-    if type(env) ~= "table" then return end
-    local newEnv = setmetatable({
-        UnitHealth    = bridgedHealth,
-        UnitHealthMax = bridgedHealthMax,
-    }, {__index = env})
-    pcall(setfenv, fn, newEnv)
+function AceEvent:ScheduleEvent(event, delay, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20)
+	if type(event) == "string" or type(event) == "table" then
+		if type(event) == "table" then
+			if not delayRegistry or not delayRegistry[event] then
+				AceEvent:error("Bad argument #2 to `ScheduleEvent'. Improper id table fed in.")
+			end
+		end
+		if type(delay) ~= "number" then
+			AceEvent:argCheck(delay, 3, "string", "function", --[[ so message is right ]] "number")
+			AceEvent:argCheck(a1, 4, "number")
+		end
+	else
+		AceEvent:argCheck(event, 2, "string", "function")
+		AceEvent:argCheck(delay, 3, "number")
+	end
+
+	return ScheduleEvent(self, false, event, delay, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20)
 end
 
--- Tag-environment patcher for addons whose loadstring'd tags are
--- setfenv'd to a private env table (Luna, SUF). Writing UnitHealth
--- directly on the env shadows the env's `__index = _G` fallback for
--- every tag that shares the env.
---
--- IMPORTANT: use rawset, not direct assignment. SUF's TagEnv has a
--- `__newindex` metamethod that silently redirects writes to `_G` —
--- which is precisely the global-override-tainting behavior we need
--- to avoid. rawset bypasses `__newindex` and writes directly to the
--- env table, so the bridge is local to that env only.
-local function patchTagEnv(tagFn)
-    if type(tagFn) ~= "function" then return nil end
-    local env = getfenv(tagFn)
-    if type(env) ~= "table" then return nil end
-    rawset(env, "UnitHealth",    bridgedHealth)
-    rawset(env, "UnitHealthMax", bridgedHealthMax)
-    return env
+function AceEvent:ScheduleRepeatingEvent(event, delay, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20)
+	if type(event) == "string" or type(event) == "table" then
+		if type(event) == "table" then
+			if not delayRegistry or not delayRegistry[event] then
+				AceEvent:error("Bad argument #2 to `ScheduleEvent'. Improper id table fed in.")
+			end
+		end
+		if type(delay) ~= "number" then
+			AceEvent:argCheck(delay, 3, "string", "function", --[[ so message is right ]] "number")
+			AceEvent:argCheck(a1, 4, "number")
+		end
+	else
+		AceEvent:argCheck(event, 2, "string", "function")
+		AceEvent:argCheck(delay, 3, "number")
+	end
+
+	return ScheduleEvent(self, true, event, delay, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, a17, a18, a19, a20)
 end
 
-local bridgesInstalled = false
-installBridges = function()
-    if bridgesInstalled then return end
-
-    -- We deliberately do NOT replace _G.UnitHealth / _G.UnitHealthMax.
-    -- Blizzard's secure TargetFrame_OnUpdate calls UnitHealth on every
-    -- frame; if the global points at our insecure wrapper, the entire
-    -- secure call chain becomes tainted and Blizzard's protected
-    -- TargetFrameToT:Show() gets blocked, breaking ToT in combat.
-    -- Instead we detect the user's primary unit-frame addon and patch
-    -- *only that one*. Bridged values stay inside that addon's own
-    -- (insecure) execution and never leak into Blizzard's secure chain.
-    --
-    -- Priority order (a typical user runs one of these as their primary):
-    --   Luna  >  ShadowedUnitFrames  >  pfUI  >  EasyFrames  >  (none)
-    -- The first match installs and we stop. If the user has none of
-    -- these, no bridge is installed and addons see raw server values.
-
-    local bridged
-
-    local lunaOUF = (LUF and LUF.oUF) or oUF
-    if lunaOUF and lunaOUF.TagsWithHeal and lunaOUF.TagsWithHeal.Methods then
-        -- Luna Unit Frames: patch the shared TagsWithHeal env so every
-        -- HP tag (smarthealth, curhp, maxhp, perhp, etc.) resolves
-        -- UnitHealth through our bridge. Also force UnitHasHealthData
-        -- true so duel partners / BG-PvP enemies show real numbers
-        -- instead of falling into the "X%" branch.
-        local env = patchTagEnv(lunaOUF.TagsWithHeal.Methods.smarthealth)
-        if env then
-            env.UnitHasHealthData = function() return true end
-            bridged = "Luna Unit Frames"
-        end
-    end
-
-    if not bridged and ShadowUF then
-        -- ShadowedUnitFrames: patch its private TagEnv (used for all
-        -- loadstring'd tag display) plus the Health module's Update
-        -- (which sets the bar fill itself).
-        --
-        -- Timing: SUF's tagFunc metamethod can return `false` at
-        -- PLAYER_LOGIN if the defaultTags table from modules/tags.lua
-        -- isn't wired in yet. We try immediately and also schedule a
-        -- delayed retry; rawset is idempotent so re-running is safe.
-        local function applySUFPatch()
-            if ShadowUF.tagFunc then
-                patchTagEnv(ShadowUF.tagFunc.maxhp)
-            end
-            if ShadowUF.modules and ShadowUF.modules.healthBar then
-                patchAddonFunc(ShadowUF.modules.healthBar.Update)
-            end
-        end
-        applySUFPatch()
-        if C_Timer and C_Timer.After then
-            C_Timer.After(1, applySUFPatch)
-        end
-        bridged = "ShadowedUnitFrames"
-    end
-
-    if not bridged and pfUI and pfUI.api and pfUI.api.tags then
-        -- pfUI: direct tag-table assignment, also expose the static DB.
-        pfUI.api.tags["curhp"] = bridgedHealth
-        pfUI.api.tags["maxhp"] = bridgedHealthMax
-        bridged = "pfUI"
-    end
-
-    if not bridged and IsAddOnLoaded and IsAddOnLoaded("ModernTargetFrame") then
-        -- ModernTargetFrame: SDPhantom's re-skin creates Blizzard-style
-        -- TextString/LeftText/RightText FontStrings on TargetFrameHealthBar
-        -- and TargetFrameManaBar, then leans on Blizzard's stock
-        -- TextStatusBar_UpdateTextString to populate them. The bar's
-        -- numeric value comes from UnitHealth (server percentage), so the
-        -- default text reads "75 / 100" for percentage-only targets.
-        --
-        -- Post-hook the update function and rewrite the text widgets with
-        -- our bridged values. hooksecurefunc is taint-safe — the hook
-        -- runs in insecure context after Blizzard's secure call returns,
-        -- so SetText on the FontStrings (which aren't protected widgets)
-        -- doesn't leak back into Blizzard's chain.
-        local function substituteText(bar)
-            if not bar or bar ~= TargetFrameHealthBar or not bar.unit then return end
-            local c, m, found = MobHealth3:GetUnitHealth(bar.unit)
-            if not found then return end
-            if bar.TextString then bar.TextString:SetText(c .. " / " .. m) end
-            if bar.LeftText  then bar.LeftText:SetText(c) end
-            if bar.RightText then bar.RightText:SetText(m) end
-        end
-        if hooksecurefunc then
-            hooksecurefunc("TextStatusBar_UpdateTextString", substituteText)
-        end
-        bridged = "ModernTargetFrame"
-    end
-
-    if not bridged and IsAddOnLoaded and IsAddOnLoaded("EasyFrames") then
-        -- EasyFrames: registers itself via Ace3 (NewAddon) — it's a local
-        -- in its own file, not a global. Fetch via LibStub. Then patch
-        -- the text formatter via setfenv. The hook runs in post-hook
-        -- (insecure) context so bridge calls don't leak taint into
-        -- Blizzard's secure chain.
-        local EF = LibStub
-            and LibStub("AceAddon-3.0", true)
-            and LibStub("AceAddon-3.0"):GetAddon("EasyFrames", true)
-        if EF and EF.Utils then
-            patchAddonFunc(EF.Utils.UpdateHealthValues)
-            patchAddonFunc(EF.Utils.UpdateManaValues)
-            bridged = "EasyFrames"
-        end
-    end
-
-    if not bridged and TargetFrameHealthBar then
-        -- Stock Blizzard fallback. Classic Era's TargetFrameHealthBar has
-        -- no built-in text widget, so we create one and drive it from
-        -- UNIT_HEALTH / PLAYER_TARGET_CHANGED events. Visibility is gated
-        -- on the user's `statusText` cvar so the addon respects the
-        -- "Status Text" Interface option instead of forcing numbers.
-        local container = CreateFrame("Frame", nil, TargetFrame)
-        container:SetAllPoints(TargetFrameHealthBar)
-        container:SetFrameLevel(TargetFrameHealthBar:GetFrameLevel() + 5)
-        local fs = container:CreateFontString(
-            "MobHealth3StockTargetText", "OVERLAY", "GameFontHighlightSmall")
-        fs:SetPoint("CENTER", container, "CENTER", 0, 0)
-
-        local function refresh()
-            local cvar = GetCVar and GetCVar("statusText")
-            if cvar ~= "1" or not UnitExists("target") then
-                fs:SetText("")
-                return
-            end
-            local c, m, found = MobHealth3:GetUnitHealth("target")
-            if found then
-                fs:SetText(c .. " / " .. m)
-            else
-                fs:SetText("")
-            end
-        end
-
-        local watcher = CreateFrame("Frame")
-        watcher:RegisterEvent("PLAYER_TARGET_CHANGED")
-        watcher:RegisterEvent("UNIT_HEALTH")
-        watcher:RegisterEvent("UNIT_MAXHEALTH")
-        watcher:RegisterEvent("CVAR_UPDATE")
-        watcher:SetScript("OnEvent", function(_, event, arg1)
-            if event == "UNIT_HEALTH" or event == "UNIT_MAXHEALTH" then
-                if arg1 ~= "target" then return end
-            end
-            refresh()
-        end)
-        refresh()
-
-        bridged = "stock Blizzard frames"
-    end
-
-    -- Nameplates are an independent display layer — bridge them in
-    -- parallel with whichever unit-frame addon won the priority chain
-    -- above. NeatPlates has its own update path; sets unit.health and
-    -- unit.healthmax in `UpdateUnitCondition` then hands the unit table
-    -- to the active theme. UpdateUnitCondition is local so we can't
-    -- setfenv it; instead we wrap the active theme's OnContextUpdate
-    -- and OnUpdate callbacks (called immediately after) to overwrite
-    -- the health fields with bridged values before the theme renders.
-    local nameplateBridged
-    if NeatPlates then
-        local function wrapTheme(theme)
-            if not theme then return end
-            -- Substitute unit.health / unit.healthmax with bridged values
-            -- for whichever unit the theme is about to render. The unit
-            -- table is mutated in-place so anything the theme reads off
-            -- it (subtext, color gradient, scale) sees real numbers.
-            local function substitute(arg1, arg2)
-                local unit = arg2 or arg1  -- (extended, unit) or just (unit)
-                local id = type(unit) == "table" and unit.unitid
-                if not id then return end
-                local c, m, found = MobHealth3:GetUnitHealth(id)
-                if found then
-                    unit.health    = c
-                    unit.healthmax = m
-                end
-            end
-            local function wrap(key, sig2)
-                local orig = theme[key]
-                if type(orig) ~= "function" then return end
-                local mark = "__mh3Wrapped_" .. key
-                if theme[mark] then return end
-                theme[key] = function(a, b)
-                    substitute(a, b)
-                    return orig(a, b)
-                end
-                theme[mark] = true
-            end
-            -- OnContextUpdate / OnUpdate fire AFTER the bar/text are
-            -- already rendered for HP changes (UpdateIndicator_HealthBar
-            -- runs before activetheme.OnUpdate inside ProcessUnitChanges),
-            -- so substituting there only updates *future* renders.
-            -- SetSubText is called from UpdateIndicator_Subtext every time
-            -- the text refreshes — wrapping it makes the displayed text
-            -- read bridged values immediately. Bar fill stays correct
-            -- because the proportion (current/max) is identical whether
-            -- we use server percentages (75/100) or bridged reals (459/612).
-            wrap("OnContextUpdate")
-            wrap("OnUpdate")
-            wrap("SetSubText")
-            wrap("SetCustomText")  -- NeatPlatesHub maps HealthTextDelegate here
-        end
-
-        -- The active theme isn't reliably at NeatPlates.ActiveThemeTable
-        -- (themes loaded via NeatPlatesInternal.UseTheme bypass that
-        -- field). NeatPlates.GetTheme() returns the actual active theme
-        -- via the local `activetheme` upvalue.
-        local function applyNPWrap()
-            if NeatPlates.GetTheme then
-                wrapTheme(NeatPlates.GetTheme())
-            end
-            wrapTheme(NeatPlates.ActiveThemeTable)  -- belt-and-braces
-        end
-        applyNPWrap()
-        -- Theme + Hub setup can finish AFTER PLAYER_LOGIN; retry once the
-        -- theme has had time to register SetCustomText etc. wrapTheme is
-        -- idempotent (marker per key prevents double-wrapping).
-        if C_Timer and C_Timer.After then
-            C_Timer.After(1, applyNPWrap)
-        end
-
-        -- Catch theme switches via the public ActivateTheme entry point.
-        if hooksecurefunc and NeatPlates.ActivateTheme then
-            hooksecurefunc(NeatPlates, "ActivateTheme", function(_, theme)
-                wrapTheme(theme)
-            end)
-        end
-
-        nameplateBridged = "NeatPlates"
-    end
-
-    -- TidyPlates_ThreatPlates: reads health via _G.UnitHealth(unitid) and
-    -- writes percent values into tp_frame.unit.health / .healthmax. Bar fill
-    -- is correct (proportion preserved) but the customtext FontString shows
-    -- "75 / 100" instead of "9000 / 12000" for non-friendly units.
-    --
-    -- Addon.UpdateUnitCondition / Addon.SetCustomText live on the per-file
-    -- private `Addon = select(2, ...)` table — no public handle, can't wrap
-    -- them. Instead, instance-shadow each plate's customtext :SetText and
-    -- rewrite numeric "X / Y" patterns whose pair matches the unit's percent
-    -- values to bridged real values. "X%" tokens need no rewrite — the ratio
-    -- is identical whether values are 75/100 or 9000/12000.
-    if IsAddOnLoaded and IsAddOnLoaded("TidyPlates_ThreatPlates") then
-        -- Match TidyPlates' TruncateWestern (Localization.lua:49) so our
-        -- replacement numbers blend with adjacent percent text. CJK locales
-        -- get the western format; minor cosmetic difference for that
-        -- audience, but avoids reaching into Addon.Truncate (also private).
-        local function tpTrunc(v)
-            local av = (v >= 0 and v) or -v
-            if av >= 1e6 then return string.format("%.1fm", v / 1e6)
-            elseif av >= 1e4 then return string.format("%.1fk", v / 1e3)
-            else return string.format("%i", v) end
-        end
-
-        local wrapped = setmetatable({}, {__mode = "k"})
-
-        local function rewriteText(text, unit)
-            local id = unit and unit.unitid
-            if not id or isFriendlyRealUnit(id) then return text end
-            local pCur, pMax = unit.health, unit.healthmax
-            if not pCur or not pMax or pMax <= 0 then return text end
-            local c, m, found = MobHealth3:GetUnitHealth(id)
-            if not found or m <= 50 then return text end
-
-            -- Match "X / Y" and "X/Y". Only replace when Y == server's percent
-            -- max (≈100); guards against unrelated numbers in the string
-            -- (e.g. an absorb tag like "[1500]" on a future retail port).
-            local function repl(sep)
-                return function(a, b)
-                    if tonumber(b) ~= pMax then return nil end
-                    local na = tonumber(a)
-                    if na == pCur then
-                        return tpTrunc(c) .. sep .. tpTrunc(m)
-                    elseif na == -(pMax - pCur) then
-                        return "-" .. tpTrunc(m - c) .. sep .. tpTrunc(m)
-                    end
-                end
-            end
-            text = string.gsub(text, "(%-?%d+) / (%d+)", repl(" / "))
-            text = string.gsub(text, "(%-?%d+)/(%d+)",   repl("/"))
-            return text
-        end
-
-        local function wrapPlate(plate)
-            local tpframe = plate and plate.TPFrame
-            if not tpframe or wrapped[tpframe] then return end
-            local visual = tpframe.visual
-            local customtext = visual and visual.customtext
-            if not customtext or type(customtext.SetText) ~= "function" then
-                return
-            end
-
-            -- FontString:SetText is a metamethod; assigning to the instance
-            -- shadows the lookup (rawget hits before __index). origSetText
-            -- captured here is the metatable method — calling it bypasses
-            -- our shadow and avoids recursion.
-            local origSetText = customtext.SetText
-            customtext.SetText = function(self, text, ...)
-                if text and text ~= "" then
-                    text = rewriteText(text, tpframe.unit)
-                end
-                return origSetText(self, text, ...)
-            end
-            wrapped[tpframe] = true
-        end
-
-        -- NAME_PLATE_UNIT_ADDED fires AFTER all addons have processed
-        -- NAME_PLATE_CREATED for the same plate, so customtext is guaranteed
-        -- to exist by then. Listening to NAME_PLATE_CREATED ourselves would
-        -- race ThreatPlates' OnNewNameplate when our handler happens to run
-        -- first.
-        local tpWatcher = CreateFrame("Frame")
-        tpWatcher:RegisterEvent("NAME_PLATE_UNIT_ADDED")
-        tpWatcher:SetScript("OnEvent", function(_, _, unitid)
-            wrapPlate(C_NamePlate.GetNamePlateForUnit(unitid))
-        end)
-
-        -- Cover plates already created before installBridges runs.
-        if C_NamePlate and C_NamePlate.GetNamePlates then
-            for _, plate in ipairs(C_NamePlate.GetNamePlates()) do
-                wrapPlate(plate)
-            end
-        end
-
-        nameplateBridged = (nameplateBridged and (nameplateBridged .. " + ThreatPlates"))
-                           or "ThreatPlates"
-    end
-
-    local msg = "|cff00ff00MobHealth3:|r "
-    if bridged and nameplateBridged then
-        msg = msg .. "bridge active for " .. bridged .. " + " .. nameplateBridged .. "."
-    elseif bridged then
-        msg = msg .. "bridge active for " .. bridged .. "."
-    elseif nameplateBridged then
-        msg = msg .. "bridge active for " .. nameplateBridged .. " (nameplates only)."
-    else
-        msg = msg .. "no supported frame addon detected; values will pass through unbridged."
-    end
-    DEFAULT_CHAT_FRAME:AddMessage(msg)
-
-    bridgesInstalled = true
+function AceEvent:CancelScheduledEvent(t)
+	AceEvent:argCheck(t, 2, "string", "table")
+	if delayRegistry then
+		local v = delayRegistry[t]
+		if v then
+			hDelete(delayHeap, v.i)
+			delayRegistry[t] = nil
+			del(v)
+			if not next(delayRegistry) then
+				AceEvent.frame:Hide()
+			end
+			return true
+		end
+	end
+	return false
 end
 
-----------------------------------------------------------------
--- Slash commands
-----------------------------------------------------------------
-SLASH_MOBHEALTH31 = "/mobhealth3"
-SLASH_MOBHEALTH32 = "/mh3"
-SlashCmdList["MOBHEALTH3"] = function(msg)
-    DEFAULT_CHAT_FRAME:AddMessage("|cff00ff00MobHealth3:|r Static DB loaded; combat estimator active.")
-    if targetName then
-        DEFAULT_CHAT_FRAME:AddMessage(string.format("  Target: %s (lvl %s)  accHP=%s  accPerc=%s",
-            tostring(targetName), tostring(targetLevel),
-            tostring(currentAccHP), tostring(currentAccPerc)))
-    end
+function AceEvent:IsEventScheduled(t)
+	AceEvent:argCheck(t, 2, "string", "table")
+	if delayRegistry then
+		local v = delayRegistry[t]
+		if v then
+			return true, v.time - GetTime()
+		end
+	end
+	return false, nil
 end
+
+function AceEvent:UnregisterEvent(event)
+	AceEvent:argCheck(event, 2, "string")
+	local AceEvent_registry = AceEvent.registry
+	if AceEvent_registry[event] and AceEvent_registry[event][self] then
+		AceEvent_registry[event][self] = nil
+		local AceEvent_onceRegistry = AceEvent.onceRegistry
+		if AceEvent_onceRegistry and AceEvent_onceRegistry[event] and AceEvent_onceRegistry[event][self] then
+			AceEvent_onceRegistry[event][self] = nil
+			if not next(AceEvent_onceRegistry[event]) then
+				AceEvent_onceRegistry[event] = del(AceEvent_onceRegistry[event])
+			end
+		end
+		local AceEvent_throttleRegistry = AceEvent.throttleRegistry
+		if AceEvent_throttleRegistry and AceEvent_throttleRegistry[event] and AceEvent_throttleRegistry[event][self] then
+			AceEvent_throttleRegistry[event][self] = del(AceEvent_throttleRegistry[event][self])
+			if not next(AceEvent_throttleRegistry[event]) then
+				AceEvent_throttleRegistry[event] = del(AceEvent_throttleRegistry[event])
+			end
+		end
+		if not next(AceEvent_registry[event]) then
+			AceEvent_registry[event] = del(AceEvent_registry[event])
+			if not AceEvent_registry[ALL_EVENTS] or not next(AceEvent_registry[ALL_EVENTS]) then
+				AceEvent.frame:UnregisterEvent(event)
+			end
+		end
+	else
+		if self == AceEvent then
+			error(string.format("Cannot unregister event %q. Improperly unregistering from AceEvent-2.0.", event), 2)
+		else
+			AceEvent:error("Cannot unregister event %q. %q is not registered with it.", event, self)
+		end
+	end
+	AceEvent:TriggerEvent("AceEvent_EventUnregistered", self, event)
+end
+
+function AceEvent:UnregisterAllEvents()
+	local AceEvent_registry = AceEvent.registry
+	if AceEvent_registry[ALL_EVENTS] and AceEvent_registry[ALL_EVENTS][self] then
+		AceEvent_registry[ALL_EVENTS][self] = nil
+		if not next(AceEvent_registry[ALL_EVENTS]) then
+			del(AceEvent_registry[ALL_EVENTS])
+			AceEvent.frame:UnregisterAllEvents()
+			for k,v in pairs(AceEvent_registry) do
+				if k ~= ALL_EVENTS then
+					AceEvent.frame:RegisterEvent(k)
+				end
+			end
+			AceEvent_registry[event] = nil
+		end
+	end
+	local first = true
+	for event, data in pairs(AceEvent_registry) do
+		if first then
+			if AceEvent_registry.AceEvent_EventUnregistered then
+				event = "AceEvent_EventUnregistered"
+			else
+				first = false
+			end
+		end
+		local x = data[self]
+		data[self] = nil
+		if x and event ~= ALL_EVENTS then
+			if not next(data) then
+				del(data)
+				if not AceEvent_registry[ALL_EVENTS] or not next(AceEvent_registry[ALL_EVENTS]) then
+					AceEvent.frame:UnregisterEvent(event)
+				end
+				AceEvent_registry[event] = nil
+			end
+			AceEvent:TriggerEvent("AceEvent_EventUnregistered", self, event)
+		end
+		if first then
+			event = nil
+		end
+	end
+	if AceEvent.onceRegistry then
+		for event, data in pairs(AceEvent.onceRegistry) do
+			data[self] = nil
+		end
+	end
+end
+
+function AceEvent:CancelAllScheduledEvents()
+	if delayRegistry then
+		for k,v in pairs(delayRegistry) do
+			if v.self == self then
+				hDelete(delayHeap, v.i)
+				del(v)
+				delayRegistry[k] = nil
+			end
+		end
+		if not next(delayRegistry) then
+			AceEvent.frame:Hide()
+		end
+	end
+end
+
+function AceEvent:IsEventRegistered(event)
+	AceEvent:argCheck(event, 2, "string")
+	local AceEvent_registry = AceEvent.registry
+	if self == AceEvent then
+		return AceEvent_registry[event] and next(AceEvent_registry[event]) and true or false
+	end
+	if AceEvent_registry[event] and AceEvent_registry[event][self] then
+		return true, AceEvent_registry[event][self]
+	end
+	return false, nil
+end
+
+local bucketfunc
+function AceEvent:RegisterBucketEvent(event, delay, method)
+	AceEvent:argCheck(event, 2, "string", "table")
+	if type(event) == "table" then
+		for k,v in pairs(event) do
+			if type(k) ~= "number" then
+				AceEvent:error("All keys to argument #2 to `RegisterBucketEvent' must be numbers.")
+			elseif type(v) ~= "string" then
+				AceEvent:error("All values to argument #2 to `RegisterBucketEvent' must be strings.")
+			end
+		end
+	end
+	AceEvent:argCheck(delay, 3, "number")
+	if AceEvent == self then
+		AceEvent:argCheck(method, 4, "function")
+		self = method
+	else
+		if type(event) == "string" then
+			AceEvent:argCheck(method, 4, "string", "function", "nil")
+			if not method then
+				method = event
+			end
+		else
+			AceEvent:argCheck(method, 4, "string", "function")
+		end
+
+		if type(method) == "string" and type(self[method]) ~= "function" then
+			AceEvent:error("Cannot register event %q to method %q, it does not exist", event, method)
+		end
+	end
+	if not AceEvent.buckets then
+		AceEvent.buckets = new()
+	end
+	if not AceEvent.buckets[event] then
+		AceEvent.buckets[event] = new()
+	end
+	if not AceEvent.buckets[event][self] then
+		AceEvent.buckets[event][self] = new()
+		AceEvent.buckets[event][self].current = new()
+		AceEvent.buckets[event][self].self = self
+	else
+		AceEvent.CancelScheduledEvent(self, AceEvent.buckets[event][self].id)
+	end
+	local bucket = AceEvent.buckets[event][self]
+	bucket.method = method
+
+	local func = function(arg1)
+		bucket.run = true
+		if arg1 then
+			bucket.current[arg1] = true
+		end
+	end
+	AceEvent.buckets[event][self].func = func
+	if type(event) == "string" then
+		AceEvent.RegisterEvent(self, event, func)
+	else
+		for _,v in ipairs(event) do
+			AceEvent.RegisterEvent(self, v, func)
+		end
+	end
+	if not bucketfunc then
+		bucketfunc = function(bucket)
+			local current = bucket.current
+			local method = bucket.method
+			local self = bucket.self
+			if bucket.run then
+				if type(method) == "string" then
+					self[method](self, current)
+				elseif method then -- function
+					method(current)
+				end
+				for k in pairs(current) do
+					current[k] = nil
+					k = nil
+				end
+				bucket.run = false
+			end
+		end
+	end
+	bucket.id = AceEvent.ScheduleRepeatingEvent(self, bucketfunc, delay, bucket)
+end
+
+function AceEvent:IsBucketEventRegistered(event)
+	AceEvent:argCheck(event, 2, "string", "table")
+	return AceEvent.buckets and AceEvent.buckets[event] and AceEvent.buckets[event][self]
+end
+
+function AceEvent:UnregisterBucketEvent(event)
+	AceEvent:argCheck(event, 2, "string", "table")
+	if not AceEvent.buckets or not AceEvent.buckets[event] or not AceEvent.buckets[event][self] then
+		AceEvent:error("Cannot unregister bucket event %q. %q is not registered with it.", event, self)
+	end
+
+	local bucket = AceEvent.buckets[event][self]
+
+	if type(event) == "string" then
+		AceEvent.UnregisterEvent(bucket.func, event)
+	else
+		for _,v in ipairs(event) do
+			AceEvent.UnregisterEvent(bucket.func, v)
+		end
+	end
+	AceEvent:CancelScheduledEvent(bucket.id)
+
+	del(bucket.current)
+	AceEvent.buckets[event][self] = del(AceEvent.buckets[event][self])
+	if not next(AceEvent.buckets[event]) then
+		AceEvent.buckets[event] = del(AceEvent.buckets[event])
+	end
+end
+
+function AceEvent:UnregisterAllBucketEvents()
+	if not AceEvent.buckets or not next(AceEvent.buckets) then
+		return
+	end
+	for k,v in pairs(AceEvent.buckets) do
+		if v == self then
+			AceEvent.UnregisterBucketEvent(self, k)
+			k = nil
+		end
+	end
+end
+
+function AceEvent:OnEmbedDisable(target)
+	self.UnregisterAllEvents(target)
+
+	self.CancelAllScheduledEvents(target)
+
+	self.UnregisterAllBucketEvents(target)
+end
+
+function AceEvent:EnableDebugging()
+	if not self.debugTable then
+		self.debugTable = new()
+	end
+end
+
+function AceEvent:IsFullyInitialized()
+	return self.postInit or false
+end
+
+function AceEvent:IsPostPlayerLogin()
+	return self.playerLogin or false
+end
+
+function AceEvent:activate(oldLib, oldDeactivate)
+	AceEvent = self
+
+	if oldLib then
+		self.onceRegistry = oldLib.onceRegistry
+		self.throttleRegistry = oldLib.throttleRegistry
+		self.delayRegistry = oldLib.delayRegistry
+		self.buckets = oldLib.buckets
+		self.delayHeap = oldLib.delayHeap
+		self.registry = oldLib.registry
+		self.frame = oldLib.frame
+		self.debugTable = oldLib.debugTable
+		self.playerLogin = oldLib.pew or DEFAULT_CHAT_FRAME and DEFAULT_CHAT_FRAME.defaultLanguage and true
+		self.postInit = oldLib.postInit or self.playerLogin and ChatTypeInfo and ChatTypeInfo.WHISPER and ChatTypeInfo.WHISPER.r and true
+		self.ALL_EVENTS = oldLib.ALL_EVENTS
+		self.FAKE_NIL = oldLib.FAKE_NIL
+		self.RATE = oldLib.RATE
+	end
+	if not self.registry then
+		self.registry = {}
+	end
+	if not self.frame then
+		self.frame = CreateFrame("Frame", "AceEvent20Frame")
+	end
+	if not self.ALL_EVENTS then
+		self.ALL_EVENTS = {}
+	end
+	if not self.FAKE_NIL then
+		self.FAKE_NIL = {}
+	end
+	if not self.RATE then
+		self.RATE = {}
+	end
+	ALL_EVENTS = self.ALL_EVENTS
+	FAKE_NIL = self.FAKE_NIL
+	RATE = self.RATE
+	local inPlw = false
+	local blacklist = {
+		UNIT_INVENTORY_CHANGED = true,
+		BAG_UPDATE = true,
+		ITEM_LOCK_CHANGED = true,
+		ACTIONBAR_SLOT_CHANGED = true,
+	}
+	self.frame:SetScript("OnEvent", function()
+		local event = event
+		if event == "PLAYER_ENTERING_WORLD" then
+			inPlw = false
+		elseif event == "PLAYER_LEAVING_WORLD" then
+			inPlw = true
+		end
+		if event and (not inPlw or not blacklist[event]) then
+			self:TriggerEvent(event, arg1, arg2, arg3, arg4, arg5, arg6, arg7, arg8, arg9)
+		end
+	end)
+	if self.delayRegistry then
+		delayRegistry = self.delayRegistry
+		delayHeap = self.delayHeap
+		self.frame:SetScript("OnUpdate", OnUpdate)
+	end
+
+	self:UnregisterAllEvents()
+	self:CancelAllScheduledEvents()
+
+	if not self.playerLogin then
+		registeringFromAceEvent = true
+		self:RegisterEvent("PLAYER_LOGIN", function()
+			self.playerLogin = true
+		end, true)
+		registeringFromAceEvent = nil
+	end
+
+	if not self.postInit then
+		local isReload = true
+		local function func()
+			self.postInit = true
+			self:TriggerEvent("AceEvent_FullyInitialized")
+			if self.registry["CHAT_MSG_CHANNEL_NOTICE"] and self.registry["CHAT_MSG_CHANNEL_NOTICE"][self] then
+				self:UnregisterEvent("CHAT_MSG_CHANNEL_NOTICE")
+			end
+			if self.registry["MEETINGSTONE_CHANGED"] and self.registry["MEETINGSTONE_CHANGED"][self] then
+				self:UnregisterEvent("MEETINGSTONE_CHANGED")
+			end
+			if self.registry["MINIMAP_ZONE_CHANGED"] and self.registry["MINIMAP_ZONE_CHANGED"][self] then
+				self:UnregisterEvent("MINIMAP_ZONE_CHANGED")
+			end
+			if self.registry["LANGUAGE_LIST_CHANGED"] and self.registry["LANGUAGE_LIST_CHANGED"][self] then
+				self:UnregisterEvent("LANGUAGE_LIST_CHANGED")
+			end
+		end
+		registeringFromAceEvent = true
+		local f = function()
+			self.playerLogin = true
+			self:ScheduleEvent("AceEvent_FullyInitialized", func, 1)
+		end
+		self:RegisterEvent("MEETINGSTONE_CHANGED", f, true)
+		self:RegisterEvent("CHAT_MSG_CHANNEL_NOTICE", function()
+			self:ScheduleEvent("AceEvent_FullyInitialized", func, 0.05)
+		end)
+		self:RegisterEvent("LANGUAGE_LIST_CHANGED", function()
+			if self.registry["MEETINGSTONE_CHANGED"] and self.registry["MEETINGSTONE_CHANGED"][self] then
+				self:UnregisterEvent("MEETINGSTONE_CHANGED")
+				self:RegisterEvent("MINIMAP_ZONE_CHANGED", f, true)
+			end
+		end)
+		registeringFromAceEvent = nil
+	end
+
+	self.super.activate(self, oldLib, oldDeactivate)
+	if oldLib then
+		oldDeactivate(oldLib)
+	end
+end
+
+AceLibrary:Register(AceEvent, MAJOR_VERSION, MINOR_VERSION, AceEvent.activate)
+AceEvent = AceLibrary(MAJOR_VERSION)
